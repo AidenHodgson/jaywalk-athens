@@ -32,9 +32,11 @@
   }
   #score { color:#fff; }
   #hudBest { color:var(--yellow); }
+  #street { color:#bfe3ff; min-height:14px; }
+  .credit { margin:14px 0 0; font:10px/1.35 system-ui, sans-serif; color:var(--muted); }
 
   #toast {
-    position:absolute; left:50%; top:calc(env(safe-area-inset-top, 0px) + 100px); transform:translateX(-50%);
+    position:absolute; left:50%; top:calc(env(safe-area-inset-top, 0px) + 122px); transform:translateX(-50%);
     padding:9px 10px 8px; background:var(--ink); color:var(--yellow); border:3px solid var(--yellow);
     box-shadow:0 0 0 3px var(--ink), 6px 6px 0 3px rgba(0,0,0,.45); pointer-events:none; opacity:0;
   }
@@ -91,16 +93,17 @@
 <body>
 <canvas id="game"></canvas>
 
-<div id="hud" class="hidden"><div id="score">0</div><div id="hudBest">BEST 0</div></div>
+<div id="hud" class="hidden"><div id="score">0</div><div id="hudBest">BEST 0</div><div id="street"></div></div>
 <div id="toast"></div>
 
 <div id="start" class="overlay">
   <div class="card">
     <div class="stripes"></div>
     <h1><span class="a">Jaywalk</span><span class="b">Athens</span></h1>
-    <p class="how" id="how">Tap to hop forward, swipe to dodge. Don't get hit!</p>
+    <p class="how" id="how">Tap to hop forward, swipe to turn down streets. The gameday crowd is right behind you!</p>
     <button id="playBtn" class="btn" type="button">Play</button>
     <p class="sub" id="startBest"></p>
+    <p class="credit">Street grid from OpenStreetMap. Map data &copy; OpenStreetMap contributors.</p>
   </div>
 </div>
 
@@ -126,20 +129,25 @@ const $ = id => document.getElementById(id);
 const canvas = $('game');
 const mainCtx = canvas.getContext('2d');
 const lo = document.createElement('canvas');   // low-res art buffer, scaled up with hard pixel edges
-const ctx = lo.getContext('2d');
+let ctx = lo.getContext('2d');   // swapped while the map is pre-painted
 const hudEl = $('hud'), scoreEl = $('score'), hudBestEl = $('hudBest'), toastEl = $('toast');
 const startEl = $('start'), overEl = $('over'), playBtn = $('playBtn'), againBtn = $('againBtn');
 const startBestEl = $('startBest'), howEl = $('how');
 const overTitleEl = $('overTitle'), overTagEl = $('overTag');
 const finalScoreEl = $('finalScore'), finalBestEl = $('finalBest'), newBestEl = $('newBest');
 
+
 // ---------------------------------------------------------------- constants
-const COLS = 9;            // playable columns
-const VIEW_COLS = 11;      // columns across a phone: the playable strip plus one tile of downtown per side
-const MIN_VIEW_ROWS = 14;  // on wide screens, always fit at least this many rows
-const HOP_TIME = 0.11;     // seconds per hop
-const CAM_FRAC = 0.3;      // player sits this fraction of the screen up from the bottom
-const BEST_KEY = 'jaywalkAthens.best';
+const VIEW_COLS = 11.5;      // tiles across a phone screen
+const MIN_VIEW_ROWS = 14;    // on wide screens, always fit at least this many rows
+const HOP_TIME = 0.11;       // seconds per hop
+const CAM_FRAC = 0.3;        // player sits this fraction of the screen up from the bottom
+const BEST_KEY = 'jaywalkAthens.downtown.best';
+const WCOLS = 45;            // world width in tiles: Pulaski St on the west to the Classic Center on the east
+const LAP = 37;              // rows in one pass of downtown, Broad St up past Dougherty St. Then it repeats.
+const CAMPUS = 16;           // rows of North Campus below Broad St on the first lap
+const START_COL = 25, START_ROW = -5;
+const PLAY_C0 = 2, PLAY_C1 = 42;   // walkable columns (the outer buildings are scenery)
 
 const CAR_COLORS = ['#e63946', '#2a6fdb', '#f4b400', '#2bb673', '#ececec', '#7b4fd6', '#ff7f3f', '#2f343c', '#4cc3e0'];
 const CAR_SHAPES = {
@@ -151,14 +159,179 @@ const BUS_STRIPES = ['#1f9e89', '#e07a2e', '#3b6fd8', '#8e44ad'];
 const WALLS = ['#a8473a', '#c4874f', '#6f8f72', '#3f5f86', '#d9c48f', '#8a5c9c', '#cf6f45', '#5d6b75', '#b5523b'];
 const AWNINGS = [['#d62839', '#f7f3e8'], ['#2a9d8f', '#f7f3e8'], ['#264653', '#e9c46a'], ['#f4a261', '#fffaf0'],
                  ['#3a5a9a', '#f7f3e8'], ['#6a994e', '#f2e8cf'], ['#1b1f2a', '#e0e0e0']];
-const MILESTONES = [[25, "Traffic's picking up"], [50, 'Game day traffic!'], [100, 'Kickoff gridlock!'],
-                    [150, 'Downtown chaos!'], [250, 'Crosswalk legend!']];
 const DEATH_LINES = {
   car: [['Flattened!', 'Should have looked both ways.'], ['Splat!', 'That car was not stopping.']],
   bus: [['Hit by the bus!', 'Long, slow, and it still got you.'], ['Wrong stop!', 'That bus waits for no one.']],
   cop: [['Busted!', 'Jaywalking has consequences.'], ['Sirens!', 'You saw the lights, right?']],
+  crowd: [['Swept up!', 'Swept up in the gameday crowd!'], ['Trampled!', 'The gameday crowd waits for no one.']],
 };
 const FACE_ANGLE = [0, Math.PI / 2, Math.PI, -Math.PI / 2]; // up, right, down, left
+
+// ---------------------------------------------------------------- the street grid (OpenStreetMap, simplified)
+// Streets west to east and south to north, in the real order. lanes[] lists travel direction per lane:
+// north-south streets go west to east (-1 southbound, +1 northbound), east-west streets go south to north (+1 eastbound).
+const VSTREETS = [
+  { name: 'Pulaski St', c0: 3, lanes: [-1, 1] },
+  { name: 'Hull St', c0: 10, lanes: [-1, -1] },           // one-way south
+  { name: 'Lumpkin St', c0: 17, lanes: [1, 1] },          // one-way north
+  { name: 'College Ave', c0: 24, lanes: [-1, 1] },        // College Square plaza between Broad and Clayton
+  { name: 'Jackson St', c0: 31, lanes: [-1, 1] },
+  { name: 'Thomas St', c0: 38, lanes: [-1, -1, 1, 1] },
+];
+const HSTREETS = [
+  { name: 'Broad St', r0: 0, lanes: [1, 1, -1, -1], green: 5.2 },
+  { name: 'Clayton St', r0: 9, lanes: [1, 1], green: 4 },      // one-way east
+  { name: 'Washington St', r0: 16, lanes: [-1, -1], green: 4 }, // one-way west
+  { name: 'Hancock Ave', r0: 23, lanes: [1, -1], green: 4 },
+  { name: 'Dougherty St', r0: 30, lanes: [1, -1], green: 4 },
+];
+const COLLEGE = 3;
+const BLOCK_C = [5, 12, 19, 26, 33];   // west sidewalk column of each block
+const BLOCK_R = [4, 11, 18, 25, 32];   // south sidewalk row of each block (within a lap)
+
+const COLK = [], ROWK = [];
+for (let c = 0; c < WCOLS; c++) {
+  let o = { k: 'edge' };
+  VSTREETS.forEach((s, i) => { if (c >= s.c0 && c < s.c0 + s.lanes.length) o = { k: 'road', v: i, ln: c - s.c0 }; });
+  BLOCK_C.forEach((b, i) => { if (c >= b && c < b + 5) o = { k: 'blk', b: i, lc: c - b }; });
+  if (c === 2 || c === 42) o = { k: 'side' };
+  COLK.push(o);
+}
+for (let r = 0; r < LAP; r++) {
+  let o = null;
+  HSTREETS.forEach((s, i) => { if (r >= s.r0 && r < s.r0 + s.lanes.length) o = { k: 'road', h: i, ln: r - s.r0 }; });
+  BLOCK_R.forEach((b, i) => { if (r >= b && r < b + 5) o = { k: 'blk', b: i, lr: r - b }; });
+  ROWK.push(o);
+}
+
+const mod = (a, n) => ((a % n) + n) % n;
+const lapOf = y => Math.floor(y / LAP);
+const okey = (c, r) => r * 64 + c;
+const isWalkCol = c => { const k = COLK[c]; return !!k && (k.k === 'side' || (k.k === 'blk' && (k.lc === 0 || k.lc === 4))); };
+const isWalkRow = r => { if (r === -1) return true; if (r < 0) return false; const k = ROWK[mod(r, LAP)]; return k.k === 'blk' && (k.lr === 0 || k.lr === 4); };
+const vRoadCol = c => COLK[c] && COLK[c].k === 'road' && COLK[c].v !== COLLEGE;
+
+// ---------------------------------------------------------------- North Campus (first lap only)
+// Iron fence along Broad with the Arch at College Ave; the quad sits between Lumpkin and Jackson.
+const GATES = [9, 16, 23, 26, 33, 37];   // gaps in the fence line up with the crosswalks; two flank the Arch so you can walk around it
+const CAMPUS_BLDGS = [   // c, r = west column and south (front) row; buildings run w east and h north
+  { id: 'chapel', c: 23, r: -11, w: 4, h: 3 },
+  { id: 'bell', c: 27, r: -10, w: 1, h: 1 },
+  { id: 'oldcollege', c: 23, r: -16, w: 4, h: 3 },
+  { id: 'holmes', c: 19, r: -8, w: 3, h: 3 },
+  { id: 'demos', c: 19, r: -13, w: 2, h: 2 },
+  { id: 'phikappa', c: 29, r: -13, w: 2, h: 2 },
+  { id: 'fountain', c: 28, r: -8, w: 2, h: 2 },
+  { id: 'hall', c: 5, r: -10, w: 4, h: 3 },
+  { id: 'hall', c: 12, r: -9, w: 4, h: 3 },
+  { id: 'hall', c: 33, r: -9, w: 4, h: 3 },
+  { id: 'hall', c: 12, r: -16, w: 3, h: 3 },
+  { id: 'hall', c: 34, r: -16, w: 3, h: 3 },
+];
+const CAMPUS_MAP = [];   // index -1 - r
+for (let i = 0; i < CAMPUS; i++) CAMPUS_MAP.push(new Array(WCOLS).fill('lawn'));
+(function buildCampus() {
+  const set = (c, r, k) => { if (c >= 0 && c < WCOLS && r < 0 && r >= -CAMPUS) CAMPUS_MAP[-1 - r][c] = k; };
+  for (const b of CAMPUS_BLDGS) for (let i = 0; i < b.w; i++) for (let j = 0; j < b.h; j++) set(b.c + i, b.r + j, b.id === 'fountain' ? 'fount' : 'bldg');
+  for (let c = 0; c < WCOLS; c++) { set(c, -1, 'side'); set(c, -2, 'fence'); set(c, -3, 'path'); }
+  for (const g of GATES) { set(g, -2, 'gate'); set(g, -4, 'path'); }
+  set(24, -2, 'arch'); set(25, -2, 'arch');
+  for (let r = -4; r >= -8; r--) { set(24, r, 'path'); set(25, r, 'path'); }
+  for (let c = 19; c <= 30; c++) set(c, -12, CAMPUS_MAP[11][c] === 'lawn' ? 'path' : CAMPUS_MAP[11][c]);
+  // big old oaks, kept off the paths and away from the start
+  for (let r = -4; r >= -CAMPUS; r--) for (let c = 0; c < WCOLS; c++) {
+    if (CAMPUS_MAP[-1 - r][c] !== 'lawn' || vRoadCol(c)) continue;
+    if (c >= 22 && c <= 27 && r >= -8) continue;
+    const near = GATES.some(g => Math.abs(g - c) <= 1) && r >= -5;
+    const h = Math.abs(Math.sin(c * 12.9898 + r * 78.233) * 43758.5453) % 1;
+    if (!near && h < (c < 2 || c > 42 ? 0.5 : 0.17)) set(c, r, 'tree');
+  }
+  for (let r = -1; r >= -CAMPUS; r--) for (let c = 0; c < WCOLS; c++) if (vRoadCol(c)) set(c, r, 'road');
+})();
+
+function tileKind(c, r) {
+  if (c < 0 || c >= WCOLS) return 'void';
+  if (r < 0) return r < -CAMPUS ? 'void' : CAMPUS_MAP[-1 - r][c];
+  const rk = ROWK[mod(r, LAP)], ck = COLK[c];
+  if (rk.k === 'road') return 'road';
+  if (ck.k === 'road') return ck.v === COLLEGE && rk.b === 0 ? 'plaza' : 'road';
+  if (ck.k === 'side') return 'side';
+  if (ck.k === 'edge') return rk.lr === 0 || rk.lr === 4 ? 'side' : 'bldg';
+  return ck.lc === 0 || ck.lc === 4 || rk.lr === 0 || rk.lr === 4 ? 'side' : 'bldg';
+}
+
+// College Square has fixed planters, and the cannon sits on the corner of College and Hancock.
+// Everything else that blocks a sidewalk comes from obstacles.
+const CANNON_C = 23, CANNON_LR = 22;
+const FIXED_BLOCK = new Set([okey(24, 6), okey(25, 7), okey(CANNON_C, CANNON_LR)]);
+const SOLID = { bldg: 1, tree: 1, fence: 1, arch: 1, fount: 1, void: 1 };
+function blocked(c, r) {
+  if (c < PLAY_C0 || c > PLAY_C1 || r < -CAMPUS) return true;
+  const k = tileKind(c, r);
+  if (SOLID[k]) return true;
+  if (r >= 0 && FIXED_BLOCK.has(okey(c, mod(r, LAP)))) return true;
+  return obst.has(okey(c, r));
+}
+
+// ---------------------------------------------------------------- where am I? (HUD street name)
+function placeName(c, r) {
+  if (r < 0) return r === -1 ? 'Broad St' : 'North Campus';
+  const lr = mod(r, LAP), rk = ROWK[lr], ck = COLK[c];
+  if (c >= 9 && c <= 12 && lr >= 15 && lr <= 18) return 'Hot Corner';
+  if (rk.k === 'road') return HSTREETS[rk.h].name;
+  if (ck.k === 'road') return ck.v === COLLEGE && rk.b === 0 ? 'College Square' : VSTREETS[ck.v].name;
+  if (rk.lr === 0) return HSTREETS[rk.b].name;
+  if (rk.lr === 4) return HSTREETS[(rk.b + 1) % 5].name;
+  if (ck.k === 'blk') return VSTREETS[ck.lc === 0 ? ck.b : ck.b + 1].name;
+  return c < 20 ? 'Pulaski St' : 'Thomas St';
+}
+
+// ---------------------------------------------------------------- landmark facts, shown once per run
+// rect in columns c0..c1 and lap rows r0..r1 (campus ones use real negative rows and only exist on lap one)
+const FACTS = [
+  { c0: 22, c1: 27, r0: -4, r1: -1, campus: 1, text: 'The Arch: legend says walk under it before you graduate and you never will.' },
+  { c0: 22, c1: 28, r0: -8, r1: -7, campus: 1, text: 'The Chapel bell gets rung after big wins.' },
+  { c0: 18, c1: 22, r0: -5, r1: -5, campus: 1, text: 'Holmes-Hunter: named for the first two Black students admitted, in 1961.' },
+  { c0: 27, c1: 30, r0: -6, r1: -5, campus: 1, text: 'Herty Field: the first football game on campus was played here in 1892.' },
+  { c0: 23, c1: 26, r0: 4, r1: 8, text: 'College Square: this block of College Ave is a pedestrian plaza now.' },
+  { c0: 13, c1: 17, r0: 11, r1: 11, text: 'Georgia Theatre: gutted by fire in 2009, rebuilt with a rooftop bar.' },
+  { c0: 9, c1: 12, r0: 15, r1: 18, text: 'Hot Corner: Washington and Hull, long the heart of Black business in Athens.' },
+  { c0: 12, c1: 15, r0: 18, r1: 18, text: 'Morton Theatre, 1910: one of the first Black-owned vaudeville theatres in the country.' },
+  { c0: 5, c1: 9, r0: 18, r1: 18, text: '40 Watt: the club at the center of the Athens music scene.' },
+  { c0: 2, c1: 42, r0: 15, r1: 15, plaque: 1, text: 'Athens Music Walk of Fame: bronze plaques honor local musicians.' },
+  { c0: 21, c1: 24, r0: 21, r1: 23, text: 'Double-Barreled Cannon, 1863: meant to fire two balls joined by a chain. It never worked. It still points north.' },
+  { c0: 14, c1: 17, r0: 22, r1: 23, text: 'Athens First United Methodist, at Hancock and Lumpkin.' },
+  { c0: 26, c1: 30, r0: 18, r1: 18, text: 'U.S. Post Office and Courthouse: federal stone and columns.' },
+  { c0: 33, c1: 37, r0: 18, r1: 18, text: 'Athens-Clarke County Courthouse, on Washington St.' },
+  { c0: 12, c1: 14, r0: 25, r1: 25, text: "Cine: downtown's independent movie house." },
+  { c0: 26, c1: 30, r0: 25, r1: 25, text: 'Denney Tower: one of the tallest buildings downtown.' },
+  { c0: 33, c1: 37, r0: 32, r1: 32, text: 'Church-Waddel-Brumby House, about 1820: likely the oldest house in Athens. Now the Welcome Center.' },
+  { c0: 41, c1: 42, r0: 11, r1: 22, text: 'The Classic Center: arena, theatre and convention hall on Thomas St.' },
+  { c0: 41, c1: 42, r0: 25, r1: 36, text: 'The old Athens Foundry cast the double-barreled cannon in 1863.' },
+];
+const PLAQUE_ROWS = [15, 18];
+const isPlaque = (c, lr) => PLAQUE_ROWS.includes(lr) && isWalkCol(c) === false && COLK[c].k === 'blk' && (COLK[c].lc === 1 || COLK[c].lc === 3);
+
+// ---------------------------------------------------------------- state
+const player = {
+  col: START_COL, row: START_ROW, fromCol: START_COL, fromRow: START_ROW, t: 1, face: 0, queued: null, alive: true,
+  bump: 0, bumpFace: 0, deadX: 0, deadY: 0, deadRot: 0,
+};
+let state = 'menu';       // menu | play | dying | over
+let freshWorld = false;
+let camX = 0, camY = 0, drawCX = 0, drawCY = 0, maxRow = START_ROW, best = loadBest(), shake = 0, deathT = 0;
+let killer = 'car', isNewBest = false, creepY = -CAMPUS, creepOn = false, playT = 0, lapShown = 0, archToastAt = -9;
+let particles = [], time = 0, inputLockUntil = 0, overShownAt = 0, streetName = '';
+let W = 0, H = 0, DPR = 1, T = 40, HB = 0, rowsVis = 20, viewCols = 11;
+let P = 1, RS = 1, TN = 16, scanPat = null;   // device px per art px, art px per CSS px, art px per tile
+
+const hLanes = new Map();   // absolute row -> east-west lane
+let vLanes = [];            // north-south through lanes
+const colLanes = new Map(); // College Ave segments (Clayton to the next Broad), keyed lap*2+lane
+const obst = new Map();     // okey -> sidewalk obstacle type
+const lapsMade = new Set();
+const seen = new Set();     // landmark facts already shown this run
+const score = () => Math.max(0, maxRow - START_ROW);
 
 // ---------------------------------------------------------------- helpers
 const rand = (a, b) => a + Math.random() * (b - a);
@@ -187,338 +360,305 @@ function hash(a, b, c) {
   return (h >>> 0) / 4294967296;
 }
 
-// "Game day traffic": 0 at the start, 1 at full game day (~row 180). Speed keeps creeping up after that.
-const heat = y => clamp((y - 8) / 170, 0, 1);
-const speedHeat = y => heat(y) + clamp((y - 180) / 500, 0, 0.35);
-
-// ---------------------------------------------------------------- state
-const rows = new Map();   // row index -> { kind:'side', style } | { kind:'road', dir, type, speed, vehicles, ... }
-let genY = 0;
-
-const player = {
-  col: 4, row: 0, fromCol: 4, fromRow: 0, t: 1, face: 0, queued: null, alive: true,
-  bump: 0, bumpFace: 0, deadX: 0, deadY: 0, deadRot: 0,
-};
-
-let state = 'menu';       // menu | play | dying | over
-let freshWorld = false;
-let camY = 0, maxRow = 0, best = loadBest(), shake = 0, deathT = 0, killer = 'car', isNewBest = false;
-let particles = [], msIndex = 0, time = 0, inputLockUntil = 0, overShownAt = 0;
-
-let W = 0, H = 0, DPR = 1, T = 40, offX = 0, rowsVis = 20, visL = 0, visR = COLS;
-let P = 1, RS = 1, TN = 16, scanPat = null;   // device px per art px, art px per CSS px, art px per tile
-
-// ---------------------------------------------------------------- layout
-function lanePad() { return Math.max(6, Math.ceil(offX / T) + 4); }
-
-function resize() {
-  W = window.innerWidth;
-  H = window.innerHeight;
-  DPR = Math.min(window.devicePixelRatio || 1, 3);
-  canvas.width = Math.round(W * DPR);
-  canvas.height = Math.round(H * DPR);
-  canvas.style.width = W + 'px';
-  canvas.style.height = H + 'px';
-  // pick a chunky pixel size so a tile is about 16 art pixels across, then size tiles in whole art pixels
-  const T0 = Math.min(W / VIEW_COLS, H / MIN_VIEW_ROWS);
-  P = Math.max(1, Math.floor(T0 * DPR / 16));
-  RS = DPR / P;
-  TN = Math.max(4, Math.floor(T0 * RS));
-  T = TN / RS;
-  offX = Math.round((W - COLS * T) / 2 * RS) / RS;
-  lo.width = Math.ceil(canvas.width / P);
-  lo.height = Math.ceil(canvas.height / P);
-  scanPat = null;
-  if (P >= 3) {                       // faint scanlines, one per art pixel row
-    const sc = document.createElement('canvas');
-    sc.width = 1; sc.height = P;
-    const g = sc.getContext('2d');
-    g.fillStyle = 'rgba(0,0,0,0.13)';
-    const n = Math.max(1, Math.round(P / 4));
-    g.fillRect(0, P - n, 1, n);
-    scanPat = mainCtx.createPattern(sc, 'repeat');
-  }
-  rowsVis = H / T;
-  visL = -offX / T;
-  visR = COLS + offX / T;
-  // if the screen got wider, stretch existing traffic loops so cars never pop in on screen
-  const need = lanePad();
-  for (const r of rows.values()) {
-    if (r.kind !== 'road' || r.type === 'cop' || r.pad >= need) continue;
-    const d = need - r.pad;
-    for (const v of r.vehicles) v.s += d;
-    r.loop += 2 * d;
-    r.pad = need;
-  }
-  refreshPxText();
+// ---------------------------------------------------------------- traffic signals
+// Every intersection runs its own cycle: east-west green, yellow, all red, north-south green, yellow, all red.
+// The offset comes from a fixed hash, so a given corner always behaves the same way.
+const YEL = 1, ALL_RED = 0.6, NS_GREEN = 4;
+const BRAKE = 14, ACCEL = 6, GAP = 0.45, TURN_TIME = 0.45;
+function sigOff(v, h, L) { const x = Math.sin(v * 127.1 + h * 311.7 + L * 74.7 + 1.3) * 43758.5453; return (x - Math.floor(x)) * 20; }
+function sigPhase(v, h, L) { return mod(time + sigOff(v, h, L), HSTREETS[h].green + 2 * (YEL + ALL_RED) + NS_GREEN); }
+function ewSig(v, h, L) { const g = HSTREETS[h].green, p = sigPhase(v, h, L); return p < g ? 0 : p < g + YEL ? 1 : 2; }   // 0 green, 1 yellow, 2 red
+function nsSig(v, h, L) {
+  const p = sigPhase(v, h, L) - HSTREETS[h].green - YEL - ALL_RED;
+  return p < 0 ? 2 : p < NS_GREEN ? 0 : p < NS_GREEN + YEL ? 1 : 2;
 }
 
-// ---------------------------------------------------------------- world generation
-function makeSide(y, style) { return { kind: 'side', y, style }; }
-
-function makeVehicle(type) {
+// ---------------------------------------------------------------- vehicles
+function makeVehicle(type, L) {
+  let o;
   if (type === 'bus') {
     const stripe = pick(BUS_STRIPES);
-    return { kind: 'bus', len: 2.9, stripe, stripeDark: shade(stripe, -0.35), s: 0, x: 0 };
+    o = { kind: 'bus', len: 2.9, stripe, stripeDark: shade(stripe, -0.35), vmax: rand(2.8, 3.4) };
+  } else if (type === 'cop') o = { kind: 'cop', len: 1.5, phase: Math.random() * 2, vmax: rand(5.4, 6.4) };
+  else {
+    const roll = Math.random(), style = roll < 0.5 ? 'sedan' : roll < 0.8 ? 'compact' : 'pickup', color = pick(CAR_COLORS);
+    o = { kind: 'car', style, len: CAR_SHAPES[style].len, color, dark: shade(color, -0.32), light: shade(color, 0.22), vmax: rand(3.6, 5) };
   }
-  if (type === 'cop') return { kind: 'cop', len: 1.5, phase: Math.random() * 2, s: 0, x: 0 };
-  const roll = Math.random();
-  const style = roll < 0.5 ? 'sedan' : roll < 0.8 ? 'compact' : 'pickup';
-  const color = pick(CAR_COLORS);
-  return { kind: 'car', style, len: CAR_SHAPES[style].len, color, dark: shade(color, -0.32), light: shade(color, 0.22), s: 0, x: 0 };
+  o.vmax *= 1 + Math.min(0.45, 0.09 * Math.max(0, L));
+  o.v = o.vmax * 0.8; o.s = 0; o.y = 0; o.u = 0; o.turn = null; o.turner = Math.random() < 0.4;
+  return o;
+}
+const vehType = (busOK, L) => { const r = Math.random(); return busOK && r < 0.14 ? 'bus' : r > 0.965 - Math.min(0.06, 0.02 * L) ? 'cop' : 'car'; };
+
+// where a car is and which way it points (screen angle: 0 east, PI/2 south). Turning cars swing between two poses.
+function carPose(car, ln) {
+  let x, y, a;
+  if (ln.row !== undefined) { x = hx(ln, car.s); y = ln.row + 0.5; a = ln.dir > 0 ? 0 : Math.PI; }
+  else { x = ln.c + 0.5; y = car.y; a = ln.dir > 0 ? -Math.PI / 2 : Math.PI / 2; }
+  if (car.turn) { const e = easeOut(car.turn.t); x = lerp(car.turn.fx, x, e); y = lerp(car.turn.fy, y, e); a = lerp(car.turn.fa, a, e); }
+  return { x, y, a };
 }
 
-function copInterval(y) { const h = heat(y); return [lerp(6.5, 2.4, h), lerp(11, 4.5, h)]; }
-
-function makeRoad(y, dir) {
-  const h = heat(y), hs = speedHeat(y);
-  const copP = y < 14 ? 0 : 0.05 + 0.22 * h;
-  const busP = y < 6 ? 0 : 0.16;
-  const roll = Math.random();
-  const type = roll < copP ? 'cop' : roll < copP + busP ? 'bus' : 'car';
-  const lane = { kind: 'road', y, dir, type, vehicles: [], speed: 1, pad: lanePad(), loop: 0, timer: 0 };
-
-  if (type === 'cop') {
-    // cop lanes are mostly empty, then a cruiser rips through fast (with a warning flash first)
-    lane.speed = rand(4.6, 5.6) * (1 + 0.5 * hs);
-    lane.timer = rand(1, copInterval(y)[1]);
-    return lane;
+// distance a car may still roll before it must stop for a light, or to keep from blocking an intersection
+function stopFree(stops, front, car, ldBack, ldV, sigf) {
+  for (const st of stops) {
+    const d = st.u - front;
+    if (d < -0.05) continue;
+    if (d > 9) break;
+    const sg = sigf(st);
+    if (sg === 2 || (sg === 1 && d >= car.v * car.v / (2 * BRAKE) * 0.8 - 0.02)) return d;
+    if (d < 2.5 && ldV < 2 && ldBack < st.far + car.len + GAP) return d;
   }
-
-  lane.speed = type === 'bus' ? rand(0.65, 1.0) * (1 + 0.9 * hs) : rand(1.0, 1.7) * (1 + 1.3 * hs);
-  const gMin = type === 'bus' ? lerp(5, 2.8, h) : lerp(3.4, 1.8, h);
-  const gMax = type === 'bus' ? lerp(9, 5.5, h) : lerp(7.5, 3.8, h);
-  const span = COLS + lane.pad * 2;
-  // vehicles ride a loop longer than the visible street; they wrap around off screen
-  let s = rand(0, gMax);
-  do {
-    const v = makeVehicle(type);
-    v.s = s;
-    lane.vehicles.push(v);
-    s += v.len + rand(gMin, gMax);
-  } while (s < span);
-  lane.loop = s;
-  return lane;
+  return 99;
+}
+function stepCar(car, free, dt) {   // ease up to speed, brake as hard as needed, never roll past the limit
+  const vt = Math.min(car.vmax, Math.sqrt(2 * BRAKE * Math.max(0, free)));
+  car.v = vt < car.v ? vt : Math.min(vt, car.v + ACCEL * dt);
+  return Math.min(car.v * dt, Math.max(0, free));
 }
 
-function genGroup() {
-  const h = heat(genY);
-  const maxLanes = genY < 14 ? 2 : Math.min(5, 2 + Math.round(h * 3.5));
-  const n = randi(1, maxLanes);
-  let dir = Math.random() < 0.5 ? 1 : -1;
+// ---------------------------------------------------------------- east-west lanes: one per road row, looping out of sight
+const HLEN = WCOLS + 8;
+const hx = (ln, s) => (ln.dir > 0 ? s - 4 : WCOLS + 4 - s);
+const hsOf = (ln, x) => (ln.dir > 0 ? x + 4 : WCOLS + 4 - x);
+
+function makeHLane(row) {
+  const rk = ROWK[mod(row, LAP)], L = lapOf(row), dir = HSTREETS[rk.h].lanes[rk.ln];
+  const ln = { row, h: rk.h, ln: rk.ln, lap: L, dir, cars: [], stops: [] };
+  VSTREETS.forEach((v, i) => {
+    const a = v.c0 - 1.1, b = v.c0 + v.lanes.length + 1.1;   // stop lines sit behind the crosswalks
+    ln.stops.push(dir > 0 ? { v: i, u: a + 4, far: b + 4 } : { v: i, u: WCOLS + 4 - b, far: WCOLS + 4 - a });
+  });
+  ln.stops.sort((p, q) => p.u - q.u);
+  const busOK = rk.h === 0 || rk.h === 2, gapK = (rk.h === 0 ? 0.8 : 1) * (1 - Math.min(0.3, 0.07 * L));
+  for (let s = rand(0, 5); s < HLEN - 3;) {
+    const car = makeVehicle(vehType(busOK, L), L);
+    car.s = s + car.len / 2;
+    ln.cars.push(car);
+    s += car.len + rand(2.6, 9) * gapK;
+  }
+  return ln;
+}
+
+function hClear(ln, s, len) {
+  for (const c of ln.cars) {
+    const gap = Math.abs(c.s - s) - (c.len + len) / 2;
+    if (gap < 0.5 || (c.s < s && gap < 0.5 + c.v * 0.6)) return false;
+  }
+  return true;
+}
+
+function updateHLane(ln, dt) {
+  const cars = ln.cars, n = cars.length;
+  if (!n) return;
+  cars.sort((a, b) => a.s - b.s);
+  const sigf = st => ewSig(st.v, ln.h, ln.lap);
+  let gone = false;
   for (let i = 0; i < n; i++) {
-    rows.set(genY, makeRoad(genY, dir));
-    genY++;
-    if (Math.random() < 0.65) dir = -dir;
+    const car = cars[i], front = car.s + car.len / 2;
+    if (car.turn && (car.turn.t += dt / TURN_TIME) >= 1) car.turn = null;
+    let ldBack = 1e9, ldV = 99;
+    if (n > 1) { const ld = cars[(i + 1) % n]; ldBack = ld.s - ld.len / 2 + (i + 1 === n ? HLEN : 0); ldV = ld.v; }
+    if (car.turner && turnIntoCollege(ln, car, front)) { car.gone = gone = true; continue; }
+    const free = Math.min(ldBack - front - GAP, stopFree(ln.stops, front, car, ldBack, ldV, sigf));
+    car.s += stepCar(car, free, dt);
+    if (car.s >= HLEN) car.s -= HLEN;
   }
-  const m = h < 0.25 ? randi(1, 2) : (Math.random() < 0.7 ? 1 : 2);
-  const style = Math.random() < 0.45 ? 'brick' : 'concrete';
-  for (let i = 0; i < m; i++) { rows.set(genY, makeSide(genY, style)); genY++; }
+  if (gone) ln.cars = cars.filter(c => !c.gone);
 }
 
-function ensureRows() {
-  const need = Math.max(Math.ceil(camY + rowsVis) + 8, player.row + 12);
-  while (genY <= need) genGroup();
+// ---------------------------------------------------------------- north-south lanes
+function vStops(dir, lo, hi) {   // stop lines (in travel units) for every cross street between rows lo and hi
+  const out = [];
+  for (let L = Math.max(0, lapOf(lo) - 1); L <= lapOf(hi); L++) HSTREETS.forEach((h, i) => {
+    const a = L * LAP + h.r0 - 1.1, b = L * LAP + h.r0 + h.lanes.length + 1.1;
+    out.push(dir > 0 ? { h: i, L, u: a, far: b } : { h: i, L, u: -b, far: -a });
+  });
+  return out.sort((p, q) => p.u - q.u);
 }
 
-function camTarget() {
-  const r = player.alive ? lerp(player.fromRow, player.row, easeOut(player.t)) : player.deadY - 0.5;
-  return r - rowsVis * CAM_FRAC;
+function makeVLane(v, i) {
+  const s = VSTREETS[v];
+  return { v, c: s.c0 + i, dir: s.lanes[i], cars: [], seg: null, fLo: 0, fHi: -1, next: rand(0.3, 2) };
 }
-
-function resetGame() {
-  seed = (Math.random() * 0x7fffffff) | 0;
-  rows.clear();
-  for (let y = -80; y < 3; y++) rows.set(y, makeSide(y, 'plaza'));
-  genY = 3;
-  Object.assign(player, { col: 4, row: 0, fromCol: 4, fromRow: 0, t: 1, face: 0, queued: null, alive: true, bump: 0 });
-  maxRow = 0; shake = 0; deathT = 0; particles = []; msIndex = 0; isNewBest = false;
-  camY = camTarget();
-  ensureRows();
-  toastEl.classList.remove('show');
-  updateHud();
-  freshWorld = true;
-}
-
-// ---------------------------------------------------------------- game flow
-function loadBest() {
-  try { return Math.max(0, parseInt(localStorage.getItem(BEST_KEY), 10) || 0); } catch (e) { return 0; }
-}
-function saveBest(v) {
-  try { localStorage.setItem(BEST_KEY, String(v)); } catch (e) { /* storage blocked: best lives for this session only */ }
-}
-
-function updateHud() {
-  pxText(scoreEl, maxRow, PX.score);
-  pxText(hudBestEl, 'BEST ' + Math.max(best, maxRow), PX.hudBest);
-}
-
-function showToast(msg) {
-  pxText(toastEl, msg, PX.toast);
-  toastEl.classList.remove('show');
-  void toastEl.offsetWidth;
-  toastEl.classList.add('show');
-}
-
-function checkMilestones() {
-  while (msIndex < MILESTONES.length && maxRow >= MILESTONES[msIndex][0]) {
-    showToast(MILESTONES[msIndex][1]);
-    msIndex++;
+function fillVLane(ln, a, b) {
+  for (let y = a + rand(0, 5); y < b;) {
+    const L = lapOf(Math.max(0, y)), car = makeVehicle(vehType(false, L), L);
+    car.y = y + car.len / 2;
+    ln.cars.push(car);
+    y += car.len + rand(3, 11) * (1 - Math.min(0.3, 0.07 * L));
   }
 }
 
-function startGame() {
-  if (state === 'play' || state === 'dying') return;
-  if (state === 'over' && performance.now() - overShownAt < 450) return; // swallow frantic taps from the run that just ended
-  if (!freshWorld) resetGame();
-  freshWorld = false;
-  state = 'play';
-  startEl.classList.add('hidden');
-  overEl.classList.add('hidden');
-  hudEl.classList.remove('hidden');
-  inputLockUntil = performance.now() + 150;
-  updateHud();
-}
-
-function showGameOver() {
-  state = 'over';
-  const line = pick(DEATH_LINES[killer] || DEATH_LINES.car);
-  pxText(overTitleEl, line[0], PX.head);
-  pxText(overTagEl, line[1], PX.small);
-  pxText(finalScoreEl, maxRow, PX.statNum);
-  pxText(finalBestEl, best, PX.statNum);
-  newBestEl.classList.toggle('hidden', !isNewBest);
-  hudEl.classList.add('hidden');
-  overEl.classList.remove('hidden');
-  overShownAt = performance.now();
-}
-
-function die(lane, vehicle, col, row) {
-  player.alive = false;
-  player.queued = null;
-  state = 'dying';
-  deathT = 0;
-  shake = 0.35;
-  killer = vehicle.kind;
-  player.deadX = col + 0.5;
-  player.deadY = row + 0.5;
-  player.deadRot = FACE_ANGLE[player.face] + rand(-0.4, 0.4);
-  // backpack bursts: homework everywhere
-  for (let i = 0; i < 14; i++) {
-    particles.push({
-      x: player.deadX, y: player.deadY, vx: rand(-3.2, 3.2) + lane.dir * 1.5, vy: rand(-3, 3),
-      rot: rand(0, 6.28), vr: rand(-9, 9), life: rand(0.9, 1.6), t: 0, w: rand(0.14, 0.22),
-      c: pick(['#ffffff', '#fdf6d8', '#f7e27a', '#cfe8ff']),
-    });
+// College Ave only runs from Clayton St north to the next Broad St (College Square is closed to cars),
+// so its cars arrive by turning in off Clayton or Broad and leave by turning back out.
+function makeColLane(L, i) {
+  const s = VSTREETS[COLLEGE];
+  const ln = { v: COLLEGE, c: s.c0 + i, dir: s.lanes[i], cars: [], seg: [L * LAP + 9, (L + 1) * LAP + 4], L };
+  ln.endU = ln.dir > 0 ? (L + 1) * LAP - 1.1 : -(L * LAP + 12.1);
+  ln.stops = vStops(ln.dir, L * LAP, (L + 1) * LAP + 4).filter(st => !(st.h === 1 && st.L === L) && !(st.h === 0 && st.L === L + 1));
+  for (let y = L * LAP + 13.5 + rand(0, 3); y < (L + 1) * LAP - 2.5;) {
+    const car = makeVehicle(vehType(false, L), L);
+    car.y = y;
+    ln.cars.push(car);
+    y += car.len + rand(3.5, 10);
   }
-  if (maxRow > best) { best = maxRow; saveBest(best); isNewBest = true; }
-  pxText(startBestEl, best > 0 ? 'Best: ' + best : '', PX.small);
+  return ln;
 }
 
-// ---------------------------------------------------------------- movement
-function requestMove(dc, dr) {
-  if (state !== 'play' || !player.alive) return;
-  if (performance.now() < inputLockUntil) return;
-  if (player.t < 1) { player.queued = [dc, dr]; return; } // buffer one move so fast tapping feels snappy
-  doMove(dc, dr);
+function turnIntoCollege(ln, car, front) {
+  let tgt, y;
+  if (ln.h === 1 && ln.ln === 1) {                                  // Clayton eastbound, left onto College northbound
+    if (nsSig(COLLEGE, 1, ln.lap) !== 0) return false;
+    tgt = colLanes.get(ln.lap * 2 + 1); y = ln.lap * LAP + 10.2 + car.len / 2;
+  } else if (ln.h === 0 && ln.ln === 2 && ln.lap > 0) {             // Broad westbound, left onto College southbound
+    if (nsSig(COLLEGE, 0, ln.lap) !== 0) return false;
+    tgt = colLanes.get((ln.lap - 1) * 2); y = ln.lap * LAP + 2.9 - car.len / 2;
+  } else return false;
+  const st = ln.stops.find(p => p.v === COLLEGE), d = st.u - front;
+  if (!tgt || d < -0.05 || d > 0.35 || car.v > 0.5) return false;
+  const u = y * tgt.dir;
+  if (tgt.cars.some(c => Math.abs(c.u - u) < (c.len + car.len) / 2 + 0.6)) return false;
+  const p = carPose(car, ln);
+  car.y = y; car.u = u; car.v = 0.8; car.turner = false;
+  car.turn = { t: 0, fx: p.x, fy: p.y, fa: p.a };
+  tgt.cars.push(car);
+  return true;
 }
 
-function doMove(dc, dr) {
-  const face = dr > 0 ? 0 : dr < 0 ? 2 : dc > 0 ? 1 : 3;
-  player.face = face;
-  const nc = player.col + dc, nr = player.row + dr;
-  if (nc < 0 || nc >= COLS || nr < 0) { player.bump = 1; player.bumpFace = face; return; }
-  player.fromCol = player.col;
-  player.fromRow = player.row;
-  player.col = nc;
-  player.row = nr;
-  player.t = 0;
-  if (nr > maxRow) { maxRow = nr; updateHud(); checkMilestones(); }
+function leaveCollege(ln, car) {
+  let row, x;
+  if (ln.dir < 0) { if (nsSig(COLLEGE, 1, ln.L) === 2) return false; row = ln.L * LAP + 10; x = ln.c + 0.3 + car.len / 2; }
+  else { row = (ln.L + 1) * LAP; x = ln.c + 0.4 + car.len / 2; }
+  const tgt = hLanes.get(row);
+  if (!tgt) return true;                      // off screen: just let it go
+  const s = hsOf(tgt, x);
+  if (!hClear(tgt, s, car.len)) return false;
+  const p = carPose(car, ln);
+  car.s = s; car.v = 1.2; car.turner = false;
+  car.turn = { t: 0, fx: p.x, fy: p.y, fa: p.a };
+  tgt.cars.push(car);
+  return true;
 }
 
-// ---------------------------------------------------------------- update
-const vehX = (r, v) => (r.type === 'cop' ? v.x : v.s - r.pad);
+function updateVLane(ln, dt) {
+  const cars = ln.cars, d = ln.dir;
+  if (!cars.length) return;
+  for (const c of cars) c.u = c.y * d;
+  cars.sort((a, b) => a.u - b.u);
+  const sigf = st => nsSig(ln.v, st.h, st.L);
+  const stops = ln.seg ? ln.stops : vStops(d, camY - 8, camY + rowsVis + 12);
+  let gone = false;
+  for (let i = 0; i < cars.length; i++) {
+    const car = cars[i], front = car.u + car.len / 2, ld = cars[i + 1];
+    if (car.turn && (car.turn.t += dt / TURN_TIME) >= 1) car.turn = null;
+    const ldBack = ld ? ld.u - ld.len / 2 : 1e9, ldV = ld ? ld.v : 99;
+    let free = Math.min(ldBack - front - GAP, stopFree(stops, front, car, ldBack, ldV, sigf));
+    if (ln.seg) {
+      const de = ln.endU - front;
+      if (de < 0.12 && car.v < 0.6 && leaveCollege(ln, car)) { car.gone = gone = true; continue; }
+      free = Math.min(free, de);
+    }
+    car.u += stepCar(car, free, dt);
+    car.y = car.u * d;
+  }
+  if (gone) ln.cars = cars.filter(c => !c.gone);
+}
+
+function manageVLane(ln, dt) {   // keep a lane stocked just past both screen edges, and feed cars in at its entry end
+  const lo = camY - 4, hi = camY + rowsVis + 4;
+  if (ln.fHi < ln.fLo) { fillVLane(ln, lo, hi); ln.fLo = lo; ln.fHi = hi; }
+  if (hi > ln.fHi) { fillVLane(ln, Math.max(ln.fHi, lo), hi); ln.fHi = hi; }
+  if (lo < ln.fLo) { fillVLane(ln, lo, Math.min(ln.fLo, hi)); ln.fLo = lo; }
+  ln.fLo = Math.max(ln.fLo, lo - 3);
+  ln.fHi = Math.min(ln.fHi, hi + 3);
+  if (ln.cars.some(c => c.y < ln.fLo - 1 || c.y > ln.fHi + 1)) ln.cars = ln.cars.filter(c => c.y >= ln.fLo - 1 && c.y <= ln.fHi + 1);
+  if ((ln.next -= dt) > 0) return;
+  const L = lapOf(Math.max(0, camY));
+  ln.next = rand(1.3, 3.6) / (1 + 0.12 * L);
+  const car = makeVehicle(vehType(false, L), L), y = ln.dir > 0 ? ln.fLo - car.len / 2 : ln.fHi + car.len / 2;
+  if (!ln.cars.some(c => Math.abs(c.y - y) < (c.len + car.len) / 2 + 1.5)) { car.y = y; ln.cars.push(car); }
+}
+
+// ---------------------------------------------------------------- sidewalk clutter
+const OBST_TYPES = ['cone', 'cone', 'barrier', 'planter', 'scooter', 'bench', 'patio', 'patio'];
+function placeObstacles(L) {
+  lapsMade.add(L);
+  const want = Math.min(26, 8 + L * 4);
+  for (let made = 0, tries = 0; made < want && tries < 500; tries++) {
+    const b = randi(0, 4), br = randi(0, 4), c0 = BLOCK_C[b], r0 = BLOCK_R[br], along = Math.random() < 0.6;
+    const c = along ? c0 + randi(1, 3) : c0 + (Math.random() < 0.5 ? 0 : 4);
+    const lr = along ? r0 + (Math.random() < 0.5 ? 0 : 4) : r0 + randi(1, 3);
+    const r = L * LAP + lr;
+    if (isPlaque(c, lr) || obst.has(okey(c, r))) continue;
+    if ([[1, 0], [-1, 0], [0, 1], [0, -1]].some(([dc, dr]) => obst.has(okey(c + dc, r + dr)))) continue;
+    let t = pick(OBST_TYPES);
+    if (t === 'patio' && !along) t = 'planter';
+    obst.set(okey(c, r), t);
+    made++;
+  }
+}
+
+// ---------------------------------------------------------------- per-frame traffic upkeep
+function manageTraffic(dt) {
+  const lo = camY - 3, hi = camY + rowsVis + 3;
+  for (let r = Math.max(0, Math.floor(lo)); r <= Math.ceil(hi); r++)
+    if (!hLanes.has(r) && ROWK[mod(r, LAP)].k === 'road') hLanes.set(r, makeHLane(r));
+  for (const r of hLanes.keys()) if (r < lo - 4 || r > hi + 6) hLanes.delete(r);
+  for (let L = Math.max(0, lapOf(lo) - 1); L <= lapOf(hi); L++) {
+    if (L * LAP + 9 > hi + 1 || (L + 1) * LAP + 4 < lo - 1) continue;
+    for (const i of [0, 1]) if (!colLanes.has(L * 2 + i)) colLanes.set(L * 2 + i, makeColLane(L, i));
+  }
+  for (const [k, ln] of colLanes) if (ln.seg[0] > hi + 7 || ln.seg[1] < lo - 7) colLanes.delete(k);
+  for (const ln of vLanes) manageVLane(ln, dt);
+  for (let L = Math.max(0, lapOf(lo)); L <= lapOf(hi + 12); L++) if (!lapsMade.has(L)) placeObstacles(L);
+}
 
 function updateTraffic(dt) {
-  const y0 = Math.floor(camY) - 3, y1 = Math.ceil(camY + rowsVis) + 3;
-  for (let y = y0; y <= y1; y++) {
-    const r = rows.get(y);
-    if (!r || r.kind !== 'road') continue;
-    const step = r.speed * r.dir * dt;
-    if (r.type === 'cop') {
-      r.timer -= dt;
-      if (r.timer <= 0) {
-        const v = makeVehicle('cop');
-        v.x = r.dir > 0 ? visL - v.len - 0.3 : visR + 0.3;
-        r.vehicles.push(v);
-        const iv = copInterval(y);
-        r.timer = rand(iv[0], iv[1]);
-      }
-      for (let i = r.vehicles.length - 1; i >= 0; i--) {
-        const v = r.vehicles[i];
-        v.x += step;
-        if (r.dir > 0 ? v.x > visR + 1 : v.x + v.len < visL - 1) r.vehicles.splice(i, 1);
-      }
-    } else {
-      for (const v of r.vehicles) {
-        v.s += step;
-        if (v.s >= r.loop) v.s -= r.loop;
-        else if (v.s < 0) v.s += r.loop;
-      }
-    }
-  }
+  manageTraffic(dt);
+  for (const ln of hLanes.values()) updateHLane(ln, dt);
+  for (const ln of vLanes) updateVLane(ln, dt);
+  for (const ln of colLanes.values()) updateVLane(ln, dt);
 }
 
-function checkHit() {
-  const e = easeOut(player.t);
-  const c = lerp(player.fromCol, player.col, e);
-  const rowNow = player.t < 0.5 ? player.fromRow : player.row; // you're "in" the new lane once you're halfway there
-  const r = rows.get(rowNow);
-  if (!r || r.kind !== 'road') return;
-  const px = c + 0.5, half = 0.27;
-  for (const v of r.vehicles) {
-    const x0 = vehX(r, v);
-    if (px + half > x0 + 0.06 && px - half < x0 + v.len - 0.06) { die(r, v, c, rowNow); return; }
-  }
+function resetTraffic() {
+  hLanes.clear(); colLanes.clear(); obst.clear(); lapsMade.clear();
+  vLanes = [];
+  VSTREETS.forEach((s, v) => { if (v !== COLLEGE) s.lanes.forEach((_, i) => vLanes.push(makeVLane(v, i))); });
+  for (let i = 0; i < 90; i++) { time += 1 / 30; updateTraffic(1 / 30); }   // let it settle so it doesn't look freshly dealt
 }
 
-function update(dt) {
-  time += dt;
-  if (player.t < 1) {
-    player.t = Math.min(1, player.t + dt / HOP_TIME);
-    if (player.t >= 1 && player.queued && player.alive && state === 'play') {
-      const q = player.queued;
-      player.queued = null;
-      doMove(q[0], q[1]);
-    }
+// ---------------------------------------------------------------- collisions
+function hitTest(px, py) {
+  const R = 0.26;
+  const hit = (car, ln) => {
+    const p = carPose(car, ln), horiz = Math.abs(Math.cos(p.a)) > 0.7;
+    const hw = car.kind === 'bus' ? 0.38 : 0.3, hl = car.len / 2 - 0.08;
+    return Math.abs(p.x - px) < (horiz ? hl : hw) + R && Math.abs(p.y - py) < (horiz ? hw : hl) + R;
+  };
+  for (let r = Math.floor(py) - 2; r <= Math.floor(py) + 2; r++) {
+    const ln = hLanes.get(r);
+    if (ln) for (const car of ln.cars) if (hit(car, ln)) return car.kind;
   }
-  if (player.bump > 0) player.bump = Math.max(0, player.bump - dt * 7);
+  for (const ln of vLanes) if (Math.abs(ln.c + 0.5 - px) < 2) for (const car of ln.cars) if (hit(car, ln)) return car.kind;
+  for (const ln of colLanes.values()) if (Math.abs(ln.c + 0.5 - px) < 2.5) for (const car of ln.cars) if (hit(car, ln)) return car.kind;
+  return null;
+}
 
-  ensureRows();
-  updateTraffic(dt);
-  if (state === 'play' && player.alive) checkHit();
-
-  camY += (camTarget() - camY) * Math.min(1, dt * 7);
-
-  if (state === 'dying' || state === 'over') deathT += dt;
-  if (state === 'dying' && deathT >= 1.0) showGameOver();
-  if (shake > 0) shake = Math.max(0, shake - dt);
-
-  const k = Math.exp(-3 * dt);
-  for (let i = particles.length - 1; i >= 0; i--) {
-    const p = particles[i];
-    p.t += dt;
-    if (p.t >= p.life) { particles.splice(i, 1); continue; }
-    p.vx *= k; p.vy *= k; p.vr *= k;
-    p.x += p.vx * dt; p.y += p.vy * dt; p.rot += p.vr * dt;
-  }
+// ---------------------------------------------------------------- the gameday crowd that sweeps up from behind
+function updateCreep(dt) {
+  if (!creepOn) { if (playT < 1.5) return; creepOn = true; }
+  const L = Math.max(0, lapOf(Math.max(0, player.row)));
+  let sp = Math.min(1.1, 0.36 + 0.08 * L + 0.004 * playT);
+  const d = player.row + 0.5 - creepY;       // they surge to about four rows behind you, then keep marching
+  if (d > 4.5) sp *= 1 + (d - 4.5) * 0.8;
+  creepY += sp * dt;
 }
 
 // ---------------------------------------------------------------- drawing helpers
 // The world is painted into a small offscreen canvas (about 16 art pixels per tile) and then blown up
 // with hard edges. Everything below snaps to that art-pixel grid so shapes stay crisp and blocky.
-const sx = c => offX + c * T;          // world column -> screen x
-const sy = y => H - (y - camY) * T;    // world row coordinate -> screen y (row r spans sy(r+1)..sy(r))
+
 const snap = v => Math.round(v * RS) / RS;
 
 function fr(x, y, w, h) {              // fillRect snapped to art pixels, never thinner than one pixel
@@ -571,144 +711,936 @@ function fillRR(x, y, w, h, r, c) {     // blocky rounded rect: corners notched 
 let ox = 0, oy = 0;
 function px(i, j, w, h, c) { if (c) ctx.fillStyle = c; ctx.fillRect(ox + i / RS, oy + j / RS, w / RS, h / RS); }
 
-// ---------------------------------------------------------------- ground
-function drawGround(y, c0, c1) {
-  const r = rows.get(y);
-  const top = snap(sy(y + 1)), bot = snap(sy(y)), h = bot - top;
-  if (r && r.kind === 'road') drawRoad(r, y, top, h, c0, c1);
-  else drawSidewalk(r ? r.style : 'plaza', y, top, h, c0, c1);
+// ---------------------------------------------------------------- map art, painted once per resize
+// The map never changes, so one lap of downtown and the strip of North Campus are painted into offscreen
+// canvases at art resolution and blitted every frame. Animated signs are listed in LIVE and redrawn on top;
+// GLOWS become a light layer that fades in after sunset.
+let lapCv = null, campusCv = null, lightCv = null;
+let rowY0 = 0, campusMode = false;            // top of row r inside the canvas being painted is (rowY0 - r) * T
+const Y = r => (rowY0 - r) * T;
+const YW = yy => (rowY0 + 1 - yy) * T;        // a world y coordinate (rows count up from the south) inside that canvas
+const LIVE = [], GLOWS = [];
+const glow = (x, y, r, c) => GLOWS.push({ x, y, r, c: c || '255,198,120' });
+function at(c, r) { ox = c * T; oy = Y(r); }
+const kindAt = (c, r) => campusMode ? (r >= 0 ? 'road' : tileKind(c, r)) : tileKind(c, mod(r, LAP));
+const roadK = (c, r) => kindAt(c, r) === 'road';
+
+function newCanvas(w, h) { const cv = document.createElement('canvas'); cv.width = w; cv.height = h; return cv; }
+function paintInto(cv, y0, fn) {
+  const keep = ctx;
+  ctx = cv.getContext('2d');
+  ctx.setTransform(RS, 0, 0, RS, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  rowY0 = y0;
+  fn();
+  ctx = keep;
 }
 
-function drawRoad(r, y, top, h, c0, c1) {
-  const q = 1 / RS;
-  ctx.fillStyle = '#3d3f4b';
-  fr(-40, top, W + 80, h);
-  for (let c = c0; c <= c1; c++) {
-    const k = hash(y, c, 11), x = sx(c);
-    // speckled asphalt, a few loose pixels per tile
-    ctx.fillStyle = '#4b4e5c';
-    fr(x + Math.floor(hash(y, c, 14) * TN) * q, top + Math.floor(hash(y, c, 15) * TN) * q, q, q);
-    fr(x + Math.floor(hash(y, c, 16) * (TN - 1)) * q, top + Math.floor(hash(y, c, 17) * TN) * q, 2 * q, q);
-    ctx.fillStyle = '#33353f';
-    fr(x + Math.floor(hash(y, c, 18) * TN) * q, top + Math.floor(hash(y, c, 19) * TN) * q, q, q);
-    if (k < 0.1) {
-      ellipse(sx(c + 0.2 + 0.6 * hash(y, c, 12)), top + h * (0.3 + 0.4 * hash(y, c, 13)), T * 0.28, T * 0.1, 'rgba(0,0,0,0.16)');
-    } else if (k > 0.965) {
-      const mx = sx(c + 0.5), my = top + h / 2;
-      circle(mx, my, T * 0.18, '#34363f');
-      ring(mx, my, T * 0.18, 1, '#26282f');
-      ctx.fillStyle = '#26282f';
-      fr(mx - T * 0.1, my - q, T * 0.2, q);
-      fr(mx - T * 0.1, my + q, T * 0.2, q);
-    }
-  }
-  const up = rows.get(y + 1), dn = rows.get(y - 1);
-  if (!up || up.kind !== 'road') { ctx.fillStyle = 'rgba(0,0,0,0.25)'; fr(-40, top, W + 80, 2 * q); }
-  if (!dn || dn.kind !== 'road') { ctx.fillStyle = 'rgba(0,0,0,0.16)'; fr(-40, top + h - 2 * q, W + 80, 2 * q); }
-  if (up && up.kind === 'road') {
-    if (up.dir !== r.dir) {
-      ctx.fillStyle = '#f2c230';
-      fr(-40, top - 2 * q, W + 80, q);
-      fr(-40, top + q, W + 80, q);
-    } else {
-      ctx.fillStyle = '#e6e4da';
-      for (let c = c0; c <= c1; c++) fr(sx(c) + T * 0.2, top - q, T * 0.6, q);
-    }
+// ---------------------------------------------------------------- ground tiles
+function asphalt(c, r) {
+  at(c, r);
+  const n = TN;
+  px(0, 0, n, n, '#3d3f4b');
+  for (let k = 0; k < 4; k++) px(Math.floor(hash(c, r, 70 + k) * n), Math.floor(hash(c, r, 80 + k) * n), 1, 1, k & 1 ? '#4b4e5c' : '#33353f');
+  const h = hash(c, r, 99);
+  if (h < 0.05) {                               // patched pothole
+    const i = 3 + Math.floor(hash(c, r, 98) * (n - 8)), j = 3 + Math.floor(hash(c, r, 97) * (n - 8));
+    px(i, j, 4, 3, '#34363f'); px(i + 1, j + 1, 2, 1, '#26282f');
+  } else if (h > 0.97) {                        // manhole
+    const i = 3 + Math.floor(hash(c, r, 96) * (n - 9)), j = 3 + Math.floor(hash(c, r, 95) * (n - 9));
+    px(i + 1, j, 3, 5, '#2b2d35'); px(i, j + 1, 5, 3, '#2b2d35'); px(i + 1, j + 2, 3, 1, '#4b4e5c');
   }
 }
 
-function drawSidewalk(style, y, top, h, c0, c1) {
-  const q = 1 / RS, n = TN, half = n >> 1;
-  if (style === 'brick') {
-    ctx.fillStyle = '#b8644b';
-    fr(-40, top, W + 80, h);
-    for (let i = 0; i < 4; i++) {
-      const j0 = Math.round(i * n / 4), ch = Math.round((i + 1) * n / 4) - j0, off = (i & 1) ? n >> 2 : 0, yy = top + j0 * q;
-      for (let c = c0; c <= c1; c++) {
-        const x = sx(c), k = hash(y * 4 + i, c, 21);
-        if (k < 0.3) {             // a few bricks a shade lighter or darker
-          ctx.fillStyle = k < 0.15 ? '#c97a5e' : '#a3543e';
-          fr(x + (off + (k < 0.08 || k > 0.22 ? half : 0)) * q, yy, half * q, ch * q);
-        }
-        ctx.fillStyle = '#7f3a2b';
-        fr(x + off * q, yy, q, ch * q);
-        fr(x + (off + half) * q, yy, q, ch * q);
-      }
-      ctx.fillStyle = '#7f3a2b';
-      fr(-40, yy, W + 80, q);
-      ctx.fillStyle = 'rgba(255,220,190,0.16)';
-      fr(-40, yy + q, W + 80, q);
-    }
-  } else if (style === 'plaza') {
-    ctx.fillStyle = '#d9c9a5';
-    fr(-40, top, W + 80, h);
-    for (let c = c0; c <= c1; c++) {
-      const x = sx(c);
-      ctx.fillStyle = '#cbb68b';   // checkerboard pavers, half a tile each
-      if ((c + y) & 1) { fr(x, top, half * q, half * q); fr(x + half * q, top + half * q, (n - half) * q, (n - half) * q); }
-      else { fr(x + half * q, top, (n - half) * q, half * q); fr(x, top + half * q, half * q, (n - half) * q); }
-      ctx.fillStyle = '#ad9a73';
-      fr(x, top, q, h);
-      fr(x + half * q, top, q, h);
-    }
-    ctx.fillStyle = '#ad9a73';
-    fr(-40, top, W + 80, q);
-    fr(-40, top + half * q, W + 80, q);
-    ctx.fillStyle = 'rgba(255,255,255,0.28)';
-    fr(-40, top + q, W + 80, q);
-    fr(-40, top + (half + 1) * q, W + 80, q);
-  } else {
-    ctx.fillStyle = '#cdc8bc';
-    fr(-40, top, W + 80, h);
-    for (let c = c0; c <= c1; c++) {
-      const x = sx(c), k = hash(y, c, 31);
-      if (k < 0.25) { ctx.fillStyle = k < 0.12 ? '#d7d3c8' : '#c3beb2'; fr(x, top, n * q, h); }
-      ctx.fillStyle = '#e6e2d8';
-      fr(x + q, top + q, (n - 2) * q, q);
-      fr(x + q, top + q, q, (n - 2) * q);
-      ctx.fillStyle = '#a19c91';
-      fr(x, top, q, h);
-      if (hash(y, c, 32) < 0.2) {  // a little zigzag crack
-        const i = 3 + Math.floor(hash(y, c, 33) * (n - 8)), j = 3 + Math.floor(hash(y, c, 34) * (n - 8));
-        fr(x + i * q, top + j * q, q, q);
-        fr(x + (i + 1) * q, top + (j + 1) * q, q, 2 * q);
-        fr(x + (i + 2) * q, top + (j + 3) * q, q, q);
-      }
-      ctx.fillStyle = '#b3aea3';
-      fr(x + Math.floor(hash(y, c, 35) * n) * q, top + Math.floor(hash(y, c, 36) * n) * q, q, q);
-    }
+function sidewalk(c, r) {
+  at(c, r);
+  const n = TN, h = hash(c, r, 11);
+  px(0, 0, n, n, h < 0.3 ? '#d7d3c8' : h > 0.85 ? '#c3beb2' : '#cdc8bc');
+  px(0, 0, n, 1, '#e6e2d8'); px(0, 0, 1, n, '#e6e2d8');
+  px(0, n - 1, n, 1, '#b3aea3'); px(n - 1, 0, 1, n, '#b3aea3');
+  if (hash(c, r, 12) < 0.3) {                   // a hairline crack
+    let i = 2 + Math.floor(hash(c, r, 13) * (n - 6)), j = 2 + Math.floor(hash(c, r, 14) * (n - 6));
     ctx.fillStyle = '#a19c91';
-    fr(-40, top, W + 80, q);
-  }
-  // curbs where the sidewalk meets a street
-  const up = rows.get(y + 1), dn = rows.get(y - 1), cw = Math.max(2, Math.round(n * 0.14));
-  if (dn && dn.kind === 'road') {
-    ctx.fillStyle = '#ebe7dc'; fr(-40, top + h - cw * q, W + 80, cw * q);
-    ctx.fillStyle = '#ffffff'; fr(-40, top + h - cw * q, W + 80, q);
-    ctx.fillStyle = '#8f8b80'; fr(-40, top + h - q, W + 80, q);
-  }
-  if (up && up.kind === 'road') {
-    ctx.fillStyle = '#ebe7dc'; fr(-40, top, W + 80, cw * q);
-    ctx.fillStyle = '#8f8b80'; fr(-40, top, W + 80, q);
-    ctx.fillStyle = 'rgba(0,0,0,0.12)'; fr(-40, top + cw * q, W + 80, q);
+    for (let k = 0; k < 4; k++) { px(i, j, 1, 1); i += 1; j += hash(c, r, 15 + k) < 0.5 ? 1 : 0; }
   }
 }
 
-// ---------------------------------------------------------------- downtown scenery (outside the playable strip)
-function drawEdgeDecor(y, c0, c1) {
-  const top = snap(sy(y + 1)), mid = top + T / 2;
-  for (let c = c0; c <= c1; c++) {
-    if (c >= 0 && c < COLS) continue;
-    const near = c === -1 || c === COLS;
-    if (!near || hash(y, c, 41) < 0.5) drawStore(c, y, top);
+function plaza(c, r) {                          // College Square: warm pavers in a running bond
+  at(c, r);
+  const n = TN;
+  px(0, 0, n, n, '#d9c9a5');
+  ctx.fillStyle = '#cbb68b';
+  for (let j = 0; j < n; j += 3) {
+    px(0, j, n, 1);
+    for (let i = (j / 3) & 1 ? 2 : 0; i < n; i += 4) px(i, j + 1, 1, 2);
   }
-  for (const c of [-1, COLS]) {
-    const k = hash(y, c, 41);
-    if (k < 0.5) continue;
-    const cx = sx(c + 0.5);
-    if (k < 0.76) drawTree(cx, mid);
-    else if (k < 0.93) drawLamp(cx, mid);
-    else drawBench(cx, mid);
+  if (hash(c, r, 16) < 0.5) px(Math.floor(hash(c, r, 17) * (n - 3)) + 1, Math.floor(hash(c, r, 18) * 4) * 3 + 1, 3, 2, '#ad9a73');
+}
+
+function pavers(c, r) {                         // campus walks: pale stone
+  at(c, r);
+  const n = TN;
+  px(0, 0, n, n, '#d8ceb4');
+  ctx.fillStyle = '#bfb294';
+  for (let j = 0; j < n; j += 4) {
+    px(0, j, n, 1);
+    for (let i = (j / 4) & 1 ? 3 : 0; i < n; i += 6) px(i, j + 1, 1, 3);
+  }
+}
+
+function lawn(c, r) {                           // mowed in stripes, a few tufts
+  at(c, r);
+  const n = TN;
+  px(0, 0, n, n, c & 1 ? '#5c9e48' : '#56973f');
+  for (let k = 0; k < 5; k++) px(Math.floor(hash(c, r, 20 + k) * n), Math.floor(hash(c, r, 30 + k) * (n - 1)), 1, 2, k & 1 ? '#72b55a' : '#4b8a3b');
+}
+
+function paintGround(c, r) {
+  const k = tileKind(c, r);
+  if (k === 'road') asphalt(c, r);
+  else if (k === 'side') sidewalk(c, r);
+  else if (k === 'plaza') plaza(c, r);
+  else if (k === 'path' || k === 'gate' || k === 'arch') pavers(c, r);
+  else if (k === 'bldg' && !campusMode) { at(c, r); px(0, 0, TN, TN, '#2a2630'); }
+  else lawn(c, r);
+}
+
+// ---------------------------------------------------------------- road markings and curbs
+function laneLine(c, r, yellow, alongX) {   // on the boundary to the next lane: top edge for east-west, right edge for north-south
+  at(c, r);
+  const n = TN;
+  if (alongX) {
+    if (yellow) { px(0, -2, n, 1, '#f2c230'); px(0, 1, n, 1, '#f2c230'); } else px(n >> 2, 0, n >> 1, 1, '#e6e4da');
+  } else if (yellow) { px(n - 2, 0, 1, n, '#f2c230'); px(n + 1, 0, 1, n, '#f2c230'); } else px(n - 1, n >> 2, 1, n >> 1, '#e6e4da');
+}
+
+function zebra(c, r, acrossH) {             // continental crosswalk: bars run with the traffic
+  at(c, r);
+  const n = TN, w = Math.max(2, Math.round(n / 8));
+  ctx.fillStyle = '#e9e6dc';
+  for (let k = w >> 1; k + w <= n; k += 2 * w) if (acrossH) px(2, k, n - 4, w); else px(k, 2, w, n - 4);
+}
+
+function paintMarks(c, r) {
+  if (tileKind(c, r) !== 'road') return;
+  const ck = COLK[c], rk = campusMode ? null : ROWK[r];
+  const hRoad = !!rk && rk.k === 'road', vRoad = ck.k === 'road';
+  if (hRoad && vRoad) return;                 // inside an intersection: bare asphalt
+  at(c, r);
+  if (hRoad) {
+    const lanes = HSTREETS[rk.h].lanes, dir = lanes[rk.ln];
+    const wOfRoad = COLK[c + 1] && COLK[c + 1].k === 'road', eOfRoad = COLK[c - 1] && COLK[c - 1].k === 'road';
+    if (isWalkCol(c) && (wOfRoad || eOfRoad)) {
+      zebra(c, r, true);
+      if (dir > 0 && wOfRoad) px(-2, 1, 2, TN - 2, '#e9e6dc');          // eastbound stop line, before the crosswalk
+      if (dir < 0 && eOfRoad) px(TN, 1, 2, TN - 2, '#e9e6dc');
+    } else if (rk.ln + 1 < lanes.length) laneLine(c, r, dir !== lanes[rk.ln + 1], true);
+    return;
+  }
+  const lanes = VSTREETS[ck.v].lanes, dir = lanes[ck.ln];
+  const southOfRoad = campusMode ? r === -1 : rk.lr === 4, northOfRoad = !campusMode && rk.lr === 0;
+  if (southOfRoad || northOfRoad) {
+    zebra(c, r, false);
+    if (dir > 0 && southOfRoad) px(1, TN, TN - 2, 2, '#e9e6dc');        // northbound stop line
+    if (dir < 0 && northOfRoad) px(1, -2, TN - 2, 2, '#e9e6dc');
+  } else if (ck.ln + 1 < lanes.length) laneLine(c, r, dir !== lanes[ck.ln + 1], false);
+}
+
+function curbs(c, r) {
+  const k = tileKind(c, r);
+  if (k !== 'side' && k !== 'plaza') return;
+  at(c, r);
+  const n = TN, brick = !campusMode && k === 'side';
+  const edge = (i, j, w, h, di, dj) => {      // brick band, then the curb face
+    if (brick) {
+      px(i + di * 2, j + dj * 2, w ? w : 3, h ? h : 3, '#b8644b');
+      ctx.fillStyle = '#7f3a2b';
+      for (let t = 1; t < n; t += 3) if (w) px(i + t, j + dj * 2 + 1, 1, 1); else px(i + di * 2 + 1, j + t, 1, 1);
+    }
+    px(i, j, w || 1, h || 1, '#8f8b80');
+    px(i + di, j + dj, w || 1, h || 1, '#ebe7dc');
+  };
+  if (roadK(c, r + 1)) edge(0, 0, n, 0, 0, 1);
+  if (roadK(c, r - 1)) edge(0, n - 1, n, 0, 0, -1);
+  if (roadK(c - 1, r)) edge(0, 0, 0, n, 1, 0);
+  if (roadK(c + 1, r)) edge(n - 1, 0, 0, n, -1, 0);
+}
+
+// ---------------------------------------------------------------- rooftops
+function roofArea(c0, r0, w, h, base) {        // flat tar roofs over a w x h tile footprint whose south-west tile is (c0, r0)
+  ox = c0 * T; oy = Y(r0 + h - 1);
+  const Wp = w * TN, Hp = h * TN, n = TN;
+  px(0, 0, Wp, Hp, base || '#4a4550');
+  for (let k = 0; k < w * h * 5; k++) px(Math.floor(hash(c0, r0, 200 + k) * Wp), Math.floor(hash(c0, r0, 300 + k) * Hp), 1, 1, k & 1 ? '#57525e' : '#403b46');
+  for (let i = 1; i < w; i++) px(i * n, 0, 1, Hp, '#36323c');
+  px(0, 0, Wp, 1, '#6a6472'); px(0, 0, 1, Hp, '#5e5866');
+  px(0, Hp - 1, Wp, 1, '#2e2a33'); px(Wp - 1, 0, 1, Hp, '#2e2a33');
+  for (let i = 0; i < w; i++) for (let j = 0; j < h; j++) {
+    const f = hash(c0 + i, r0 + j, 61), x = i * n + 3 + Math.floor(hash(c0 + i, r0 + j, 62) * (n - 9)), y = j * n + 3 + Math.floor(hash(c0 + i, r0 + j, 63) * (n - 9));
+    if (f < 0.35) {                            // AC unit with a fan
+      px(x, y, 6, 5, '#9aa1a8'); px(x, y + 4, 6, 1, '#6e757c'); px(x + 1, y + 1, 3, 3, '#5f666d'); px(x + 2, y + 2, 1, 1, '#c6ccd2');
+    } else if (f < 0.55) {                     // skylight
+      px(x, y, 5, 4, '#2f3a48'); px(x + 1, y + 1, 3, 2, '#7fa6c4'); px(x + 1, y + 1, 1, 1, '#d6ecff');
+    } else if (f < 0.7) {                      // vent stacks
+      px(x, y, 2, 2, '#7d838a'); px(x + 4, y + 2, 2, 2, '#7d838a'); px(x, y + 2, 2, 1, '#2a2d33');
+    } else if (f < 0.76 && h > 1) {            // wooden water tank on legs
+      px(x, y + 5, 1, 2, '#2a2d33'); px(x + 5, y + 5, 1, 2, '#2a2d33');
+      px(x, y, 6, 5, '#8a5a3a'); px(x + 1, y - 1, 4, 1, '#6b4430'); px(x, y + 2, 6, 1, '#5e3c28');
+    }
+  }
+}
+
+// gabled roof for houses: shingles in courses, ridge across the middle
+function gable(c, r, col) {
+  at(c, r);
+  const n = TN, dark = shade(col, -0.3);
+  px(0, 0, n, n, col);
+  ctx.fillStyle = dark;
+  for (let j = 2; j < n; j += 3) px(0, j, n, 1);
+  px(0, (n >> 1) - 1, n, 2, shade(col, 0.25));
+  px(0, 0, 1, n, dark); px(n - 1, 0, 1, n, dark);
+  if (hash(c, r, 64) < 0.6) { px(3 + Math.floor(hash(c, r, 65) * (n - 8)), 1, 3, 4, '#8a3b2c'); }   // chimney
+}
+
+// ---------------------------------------------------------------- street furniture painted into the map
+function lampPost(x, y) {                      // x, y: base point in canvas px
+  const q = 1 / RS;
+  ellipse(x + T * 0.08, y + q, T * 0.1, T * 0.04, 'rgba(0,0,0,0.25)');
+  ctx.fillStyle = '#1f2d26';
+  fr(x - q, y - T * 0.5, 2 * q, T * 0.5);
+  fr(x - 2 * q, y - q, 4 * q, 2 * q);
+  fr(x - 2 * q, y - T * 0.5 - 2 * q, 4 * q, 2 * q);
+  ctx.fillStyle = '#fff1c2';
+  fr(x - q, y - T * 0.5 - q, 2 * q, q);
+  glow(x, y - T * 0.5, T * 1.1, '255,214,140');
+}
+
+function planter(c, r) {
+  at(c, r);
+  const n = TN;
+  px(1, 3, n - 2, n - 4, '#7f3a2b');
+  px(2, 4, n - 4, n - 6, '#a3543e');
+  px(3, 4, n - 6, n - 8, '#4a3a2a');
+  for (let k = 0; k < 9; k++) {
+    const i = 3 + Math.floor(hash(c, r, 40 + k) * (n - 7)), j = 2 + Math.floor(hash(c, r, 50 + k) * (n - 8));
+    px(i, j, 2, 2, k % 3 ? '#3e9a47' : '#2f7d3a');
+    if (k % 4 === 0) px(i, j, 1, 1, k & 1 ? '#ff6b8a' : '#ffd23f');
+  }
+}
+
+function plaque(c, r) {                        // Music Walk of Fame: a bronze square set in the sidewalk
+  at(c, r);
+  const n = TN, s = Math.max(5, Math.round(n * 0.44)), i = (n - s) >> 1;
+  px(i, i, s, s, '#6e4e22');
+  px(i + 1, i + 1, s - 2, s - 2, '#b08440');
+  px(i + 1, i + 1, s - 2, 1, '#e0b868');
+  const m = i + (s >> 1);                      // a tiny eighth note
+  px(m, i + 2, 1, s - 4, '#5a3e18'); px(m - 2, i + s - 3, 2, 2, '#5a3e18'); px(m + 1, i + 2, 1, 1, '#5a3e18');
+}
+
+function cannon(c, r) {                        // the double-barreled cannon, both muzzles pointing north
+  at(c, r);
+  const n = TN, k = Math.max(1, n >> 4);
+  px(1, 2, n - 2, n - 3, '#9c968a');           // granite base
+  px(2, 3, n - 4, n - 5, '#b9b3a6');
+  px(1, n - 2, n - 2, 1, '#77726a');
+  const b0 = (n >> 1) - 3 * k, bw = 2 * k;
+  for (const i of [b0, b0 + 4 * k]) {          // two barrels side by side
+    px(i, 1, bw, n - 6, '#2c2f33');
+    px(i, 1, bw, k, '#4a4f55');
+    px(i + (bw >> 1), 1, Math.max(1, k), 1, '#0e0f11');
+  }
+  px(b0 - k, n - 7, 6 * k + bw, 2 * k, '#2c2f33');  // breech block
+  px(2, n - 8, 2 * k + 1, 5, '#5a3e24'); px(n - 3 - 2 * k, n - 8, 2 * k + 1, 5, '#5a3e24');   // wheels
+}
+
+function stringLights(c0, c1, r) {             // over College Square
+  const y = Y(r) + T * 0.15, q = 1 / RS;
+  ctx.fillStyle = '#2a2630';
+  fr(c0 * T, y, (c1 - c0 + 1) * T, q);
+  for (let x = c0 * T + 2 * q; x < (c1 + 1) * T; x += 4 * q) {
+    ctx.fillStyle = '#f7e7b0'; fr(x, y + q, q, q);
+    glow(x, y + q, T * 0.35, '255,220,150');
+  }
+}
+
+function paintStreetDecor() {
+  for (let r = 0; r < LAP; r++) for (let c = 0; c < WCOLS; c++) if (isPlaque(c, r)) plaque(c, r);
+  planter(24, 6); planter(25, 7);
+  stringLights(23, 26, 5); stringLights(23, 26, 7);
+  cannon(CANNON_C, CANNON_LR);
+  for (const v of VSTREETS) for (const h of HSTREETS) {          // lamps on the two north corners of every intersection
+    const yy = h.r0 + h.lanes.length + 0.18;
+    lampPost((v.c0 - 0.18) * T, YW(yy));
+    lampPost((v.c0 + v.lanes.length + 0.18) * T, YW(yy));
+  }
+}
+
+function paintLights() {
+  for (const g of GLOWS) {
+    circle(g.x, g.y, g.r, 'rgba(' + g.c + ',0.09)');
+    circle(g.x, g.y, g.r * 0.62, 'rgba(' + g.c + ',0.15)');
+    circle(g.x, g.y, g.r * 0.3, 'rgba(' + g.c + ',0.3)');
+  }
+}
+
+function buildArt() {
+  Object.assign(MINI, MINI_MORE);
+  LIVE.length = 0; GLOWS.length = 0;
+  lapCv = newCanvas(WCOLS * TN, LAP * TN);
+  lightCv = newCanvas(WCOLS * TN, LAP * TN);
+  campusCv = newCanvas(WCOLS * TN, CAMPUS * TN);
+  campusMode = false;
+  paintInto(lapCv, LAP - 1, () => {
+    for (let r = LAP - 1; r >= 0; r--) for (let c = 0; c < WCOLS; c++) paintGround(c, r);
+    for (let r = LAP - 1; r >= 0; r--) for (let c = 0; c < WCOLS; c++) { paintMarks(c, r); curbs(c, r); }
+    paintBlocks();
+    paintStreetDecor();
+  });
+  paintInto(lightCv, LAP - 1, paintLights);
+  campusMode = true;
+  paintInto(campusCv, -1, () => {
+    for (let r = -1; r >= -CAMPUS; r--) for (let c = 0; c < WCOLS; c++) paintGround(c, r);
+    for (let r = -1; r >= -CAMPUS; r--) for (let c = 0; c < WCOLS; c++) { paintMarks(c, r); curbs(c, r); }
+    paintCampus();
+  });
+  campusMode = false;
+}
+
+// ---------------------------------------------------------------- downtown blocks: facades, landmarks, rooftops
+// Each block holds 3 x 3 tiles of building. The camera looks north, so the south row shows a facade and the two
+// rows behind it are rooftops. Landmarks sit on the block they really occupy (OpenStreetMap); everything else gets
+// a generic storefront. Signs carry only local place names, never brands or school marks.
+const MINI_MORE = { D: '65556', G: '34553', M: '57755', N: '65555', Y: '55222' };   // extra sign letters, merged into MINI when the art is built
+
+function signW(word, Wd, j, c) {               // lettering centered across a facade Wd art pixels wide
+  const len = word.length * 4 - 1;
+  if (Wd < len) return;
+  ctx.fillStyle = c;
+  let i = Math.floor((Wd - len) / 2);
+  for (const ch of word) { glyph(ch, i, j); i += 4; }
+}
+function roofW(Wd, rh, c) { px(0, 0, Wd, rh, c); px(0, 0, Wd, 1, 'rgba(255,255,255,0.16)'); px(0, rh - 1, Wd, 1, 'rgba(0,0,0,0.3)'); }
+function columns(Wd, j0, j1, k, stone, mid) {
+  const gap = (Wd - k * 2) / (k + 1);
+  for (let i = 0; i < k; i++) { const x = Math.round(gap + i * (2 + gap)); px(x, j0, 2, j1 - j0, stone); px(x + 1, j0, 1, j1 - j0, mid); }
+}
+function chase(i, j, w, sp) {                  // marquee bulbs running along a row
+  const ph = Math.floor(time * sp);
+  for (let k = 0; k < w; k += 2) px(i + k, j, 1, 1, ((k >> 1) + ph) & 1 ? '#ffd23f' : '#c0702a');
+}
+
+// ---------------------------------------------------------------- landmark facades (Wd: width in art px)
+function f40Watt(Wd) {                         // the club: black front, a bare lightbulb for a sign
+  const n = TN, rh = tf(0.16), j = rh + 1, cx = Wd >> 1, on = Math.floor(time * 1.7) % 7 !== 0;
+  roofW(Wd, rh, '#1f1a24');
+  px(0, rh, Wd, n - rh, '#26222c');
+  const g = on ? '#fff3b0' : '#6f6a55';
+  px(cx - 2, j, 5, 1, g); px(cx - 3, j + 1, 7, 3, g); px(cx - 2, j + 4, 5, 1, g); px(cx - 1, j + 5, 3, 1, g);
+  px(cx, j + 2, 1, 3, on ? '#ffb030' : '#4a4535');
+  if (on) px(cx - 2, j + 1, 1, 2, '#ffffff');
+  px(cx - 1, j + 6, 3, 2, '#9aa1a8'); px(cx - 1, j + 7, 3, 1, '#6e757c');
+  door(3, j + 9, Wd - 6, '#3a2a40');
+}
+
+function fFlicker(Wd) {                        // the bar whose sign lives up to its name
+  const n = TN, rh = tf(0.18), word = 'FLICKER';
+  roofW(Wd, rh, '#2a2433');
+  px(0, rh, Wd, n - rh, '#5a3a2e');
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  for (let j = rh + 2; j < n; j += 3) px(0, j, Wd, 1);
+  px(1, rh + 1, Wd - 2, 7, '#1d1b2e');
+  let i = (Wd - (word.length * 4 - 1)) >> 1;
+  for (let k = 0; k < word.length; k++) {
+    ctx.fillStyle = Math.floor(time * 6 + k * 3.7) % 13 ? '#7fe8ff' : '#2f4a55';
+    glyph(word[k], i, rh + 2); i += 4;
+  }
+  const wj = rh + 9, half = Wd >> 1;
+  win(2, wj, half - 4, n - wj - 1, '#ffb347');
+  door(half - 1, wj - 1, 4, '#3a2028');
+  win(half + 4, wj, Wd - half - 6, n - wj - 1, '#ffb347');
+}
+
+function fMorton(Wd) {                         // Morton Theatre, 1910: pale brick, arched windows, name band
+  const n = TN, rh = tf(0.14), sj = n - 10;
+  roofW(Wd, rh, '#4a3d44');
+  px(0, rh, Wd, n - rh, '#c9a77a');
+  ctx.fillStyle = 'rgba(0,0,0,0.1)';
+  for (let j = rh + 3; j < n; j += 3) px(0, j, Wd, 1);
+  px(0, rh, Wd, 2, '#efe2c4');
+  for (let i = 2; i + 3 <= Wd - 1; i += 5) { px(i + 1, rh + 2, 1, 1, '#56719a'); px(i, rh + 3, 3, Math.max(1, sj - rh - 4), '#56719a'); }
+  px(1, sj, Wd - 2, 7, '#7a1f2b');
+  signW('MORTON', Wd, sj + 1, '#fff3d6');
+  door(3, sj + 7, 4, '#5a2028'); door(Wd - 7, sj + 7, 4, '#5a2028');
+}
+
+function fChurch(Wd) {                         // First United Methodist: brick, one tall stained glass window
+  const n = TN, rh = tf(0.12), cx = Wd >> 1;
+  roofW(Wd, rh, '#6b6f78');
+  px(0, rh, Wd, n - rh, '#9c4a3a');
+  px(cx - 2, rh + 2, 4, 1, '#e8d9b8'); px(cx - 3, rh + 3, 6, n - rh - 9, '#e8d9b8');
+  px(cx - 2, rh + 3, 4, n - rh - 9, '#7a5ab0'); px(cx - 1, rh + 4, 1, 2, '#ffd23f'); px(cx, rh + 6, 1, 2, '#e8364f');
+  door(cx - 2, n - 5, 4, '#f2efe6');
+}
+
+function fGeorgia(Wd) {                        // Georgia Theatre: blade sign over the roofline, chasing marquee
+  const n = TN, rh = tf(0.14), sj = n - 10, ph = Math.floor(time * 6);
+  roofW(Wd, rh, '#3a2340');
+  px(0, rh, Wd, n - rh, '#7a2a2a');
+  ctx.fillStyle = 'rgba(0,0,0,0.16)';
+  for (let j = rh + 2; j < n; j += 3) px(0, j, Wd, 1);
+  for (let i = 6; i + 3 < Wd - 1; i += 5) px(i, rh + 2, 3, Math.max(1, sj - rh - 3), '#ffd36b');
+  px(0, sj, Wd, 7, '#fff3d6');
+  chase(0, sj, Wd, 6); chase(1, sj + 6, Wd - 1, 6);
+  signW('THEATRE', Wd, sj + 1, '#c0282d');
+  px(1, 0, 3, sj, '#1d1b2e');
+  for (let j = 1; j < sj; j += 2) px(2, j, 1, 1, ((j >> 1) + ph) & 1 ? '#ffd23f' : '#ff6b2c');
+  const dj = sj + 7;
+  px(4, dj, Wd - 8, n - dj, '#1d1b2e'); px(5, dj + 1, Wd - 10, n - dj - 1, '#e8b44a');
+  ctx.fillStyle = '#1d1b2e';
+  for (let i = 8; i < Wd - 5; i += 4) px(i, dj + 1, 1, n - dj - 1);
+}
+
+function fDeck(Wd) {                           // the College Ave parking deck
+  const n = TN, rh = tf(0.12);
+  roofW(Wd, rh, '#7d838a');
+  px(0, rh, Wd, n - rh, '#a7adb3');
+  for (let k = 0, j = rh + 1; j + 1 < n - 5; k++, j += 4) {
+    px(0, j, Wd, 2, '#2a2d33');
+    for (let i = 1; i < Wd - 3; i += 4) if (hash(i, k, 77) < 0.55) px(i, j + 1, 3, 1, CAR_COLORS[Math.floor(hash(k, i, 78) * CAR_COLORS.length)]);
+  }
+  const pi = Wd - 7;
+  px(pi, rh + 1, 5, 7, '#2a6fdb');
+  ctx.fillStyle = '#ffffff'; glyph('P', pi + 1, rh + 2);
+  px(4, n - 5, 10, 5, '#1d1b2e'); px(4, n - 5, 10, 1, '#f2c230');
+}
+
+function fCityHall(Wd) {
+  const n = TN, rh = tf(0.1), stone = '#efe6cf', mid = '#cdbf9c', cj = rh + 10, sj = n - 2;
+  roofW(Wd, rh, '#6f7a7e');
+  px(0, rh, Wd, n - rh, stone);
+  px(0, rh, Wd, 1, '#ffffff');
+  px(2, rh + 2, Wd - 4, 7, '#2c4a6a');
+  signW('CITY HALL', Wd, rh + 3, '#fff3d6');
+  px(0, cj, Wd, sj - cj, '#4a4038');
+  columns(Wd, cj, sj, Math.max(6, Math.floor(Wd / 7)), stone, mid);
+  px(0, sj, Wd, 1, '#d8ccb0'); px(0, sj + 1, Wd, n - sj - 1, '#b3a78c');
+}
+
+function civic(Wd, word, stone, mid, roofC, letter) {   // stone front, carved name, a row of columns, steps
+  const n = TN, rh = tf(0.1), cj = rh + 9, sj = n - 2;
+  roofW(Wd, rh, roofC);
+  px(0, rh, Wd, n - rh, stone);
+  px(0, rh, Wd, 1, '#ffffff'); px(0, rh + 1, Wd, 1, mid);
+  signW(word, Wd, rh + 3, letter);
+  px(0, cj, Wd, 1, mid);
+  px(0, cj + 1, Wd, sj - cj - 1, '#4a4038');
+  columns(Wd, cj + 1, sj, Math.max(6, Math.floor(Wd / 6)), stone, mid);
+  px(0, sj, Wd, 1, '#d8ccb0'); px(0, sj + 1, Wd, n - sj - 1, '#b3a78c');
+}
+const fPostOffice = Wd => civic(Wd, 'POST OFFICE', '#d9d4c7', '#a9a397', '#5d6b75', '#3a3f4a');
+const fCourthouse = Wd => civic(Wd, 'COURTHOUSE', '#ece2c8', '#c4b48e', '#5f8f7e', '#5a4630');
+
+function fCine(Wd) {                           // Cine: small marquee, two poster cases
+  const n = TN, rh = tf(0.16), pj = rh + 9;
+  roofW(Wd, rh, '#2a2433');
+  px(0, rh, Wd, n - rh, '#2f4f4f');
+  px(0, rh + 1, Wd, 7, '#1d1b2e');
+  chase(0, rh + 1, Wd, 4); chase(1, rh + 7, Wd - 1, 4);
+  signW('CINE', Wd, rh + 2, '#ffe9a8');
+  for (const i of [1, Wd - 5]) { px(i, pj, 4, n - pj - 1, '#e8d9b8'); px(i + 1, pj + 1, 2, Math.max(1, n - pj - 3), i < 4 ? '#e8364f' : '#4cc3e0'); }
+  px(6, pj, Wd - 12, n - pj, '#1d1b2e'); px(7, pj + 1, Wd - 14, n - pj - 1, '#ffcf80');
+}
+
+function fHotel(Wd) {
+  const n = TN, rh = tf(0.1), sj = rh + 1, cx = Wd >> 1;
+  roofW(Wd, rh, '#5a5560');
+  px(0, rh, Wd, n - rh, '#7c4536');
+  for (let j = sj + 7; j + 2 <= n - 5; j += 3) for (let i = 1; i + 3 <= Wd - 1; i += 4) px(i, j, 3, 2, hash(i, j, 41) < 0.55 ? '#ffd36b' : '#3d5674');
+  px(cx - 11, sj, 23, 7, '#1d1b2e');
+  signW('HOTEL', Wd, sj + 1, '#f7f3e8');
+  px(cx - 9, n - 5, 18, 2, '#1d1b2e'); px(cx - 9, n - 4, 18, 1, '#c9a227');
+  px(cx - 5, n - 3, 10, 3, '#9fd0e0'); px(cx, n - 3, 1, 3, '#1d1b2e');
+}
+
+function fOffice(Wd, wall) {
+  const n = TN, rh = tf(0.12), cx = Wd >> 1;
+  roofW(Wd, rh, '#4f4a56');
+  px(0, rh, Wd, n - rh, wall);
+  px(0, rh, Wd, 1, '#e8d9b8');
+  for (let j = rh + 2; j + 3 <= n - 5; j += 4) for (let i = 2; i + 3 <= Wd - 2; i += 4) px(i, j, 3, 3, hash(i, j, 61) < 0.35 ? '#ffd36b' : '#4f6a8a');
+  px(0, n - 5, Wd, 1, '#e8d9b8');
+  px(0, n - 4, Wd, 4, shade(wall, -0.3));
+  px(cx - 4, n - 4, 8, 4, '#9fd0e0'); px(cx, n - 4, 1, 4, '#1d1b2e');
+}
+
+function fTower(Wd, Hd) {                      // Denney Tower: a facade two rows tall
+  px(0, 0, Wd, Hd, '#d6d0c2');
+  px(0, 0, Wd, 2, '#efebe2'); px(Wd - 2, 0, 2, Hd, '#b5ae9f');
+  for (let j = 3; j + 2 <= Hd - 6; j += 3) for (let i = 2; i + 2 <= Wd - 3; i += 3) px(i, j, 2, 2, hash(i, j, 52) < 0.4 ? '#ffd36b' : '#4f6a8a');
+  px(0, Hd - 6, Wd, 1, '#efebe2'); px(0, Hd - 5, Wd, 5, '#8f8a80');
+  px(4, Hd - 4, Wd - 8, 4, '#2f3a48'); px(5, Hd - 3, Wd - 10, 3, '#9fd0e0');
+}
+
+function fWelcome(Wd) {                        // Church-Waddel-Brumby House: white clapboard, green shutters
+  const n = TN, rh = tf(0.1), cx = Wd >> 1, wj = rh + 8;
+  roofW(Wd, rh, '#3d434b');
+  px(0, rh, Wd, n - rh, '#f2efe6');
+  ctx.fillStyle = '#dcd7ca';
+  for (let j = rh + 2; j < n - 1; j += 2) px(0, j, Wd, 1);
+  for (const i of [3, 10, Wd - 15, Wd - 8]) { px(i - 1, wj, 1, n - wj - 1, '#2f5d4a'); px(i + 4, wj, 1, n - wj - 1, '#2f5d4a'); win(i, wj, 4, n - wj - 1, '#ffe2a8'); }
+  px(cx - 3, wj, 7, 1, '#ffffff');
+  door(cx - 2, wj + 1, 5, '#2f5d4a');
+  px(cx - 15, rh + 1, 31, 7, '#2f5d4a');
+  signW('WELCOME', Wd, rh + 2, '#f7f3e8');
+}
+
+function fClassic(Wd) {                        // Classic Center: brick frame around a glass atrium
+  const n = TN;
+  px(0, 0, Wd, n, '#a9574a');
+  ctx.fillStyle = 'rgba(0,0,0,0.12)';
+  for (let j = 2; j < n; j += 3) px(0, j, Wd, 1);
+  px(3, 2, Wd - 6, n - 2, '#d9d4c7');
+  px(4, 3, Wd - 8, n - 3, '#2d4a66');
+  ctx.fillStyle = '#9fd0e0';
+  for (let j = 5; j < n; j += 3) for (let i = 5; i < Wd - 5; i += 3) px(i, j, 2, 2);
+}
+function fArena(Wd) {                          // its arena: concrete, red and black banners
+  const n = TN;
+  px(0, 0, Wd, n, '#c9c4b8');
+  px(0, 0, Wd, 2, '#e6e2d8');
+  for (let i = 3; i + 3 < Wd; i += 6) px(i, 3, 3, 7, (i / 6 | 0) & 1 ? '#1d1b2e' : '#c0282d');
+  px(4, n - 5, Wd - 8, 5, '#2f3a48'); px(5, n - 4, Wd - 10, 4, '#9fd0e0');
+  ctx.fillStyle = '#2f3a48';
+  for (let i = 8; i < Wd - 5; i += 4) px(i, n - 4, 1, 4);
+}
+function fFoundry(Wd) {                        // the old foundry: brick, tall arched openings
+  const n = TN, rh = tf(0.14);
+  roofW(Wd, rh, '#4a3d44');
+  px(0, rh, Wd, n - rh, '#8e3e2e');
+  ctx.fillStyle = 'rgba(0,0,0,0.16)';
+  for (let j = rh + 2; j < n; j += 3) px(0, j, Wd, 1);
+  for (let i = 2; i + 4 <= Wd - 2; i += 6) { px(i + 1, rh + 3, 2, 1, '#e8d9b8'); px(i, rh + 4, 4, n - rh - 7, '#e8d9b8'); px(i + 1, rh + 4, 2, n - rh - 7, '#ffcf80'); }
+  px(0, n - 2, Wd, 2, '#6e2f24');
+}
+function fHouse(Wd, k) {                       // west side: old houses with deep porches
+  const n = TN, siding = ['#e8dcc0', '#c9d6df', '#e6c9b8', '#d4e0c8', '#f0e6d0'][k % 5];
+  px(0, 0, Wd, n, siding);
+  ctx.fillStyle = shade(siding, -0.1);
+  for (let j = 1; j < n - 6; j += 2) px(0, j, Wd, 1);
+  for (const i of [3, Wd - 8]) win(i, 2, 5, 5, '#ffe2a8');
+  px(0, n - 6, Wd, 1, '#ffffff');
+  px(0, n - 5, Wd, 5, shade(siding, -0.32));
+  door((Wd >> 1) - 2, n - 5, 4, '#7a3f2a');
+  columns(Wd, n - 5, n - 1, 4, '#ffffff', '#d8d3c6');
+  px(0, n - 1, Wd, 1, '#8f8b80');
+}
+
+// ---------------------------------------------------------------- special rooftops
+function houseRoof(c0, r0, w, h, col) {
+  ox = c0 * T; oy = Y(r0 + h - 1);
+  const Wd = w * TN, Hd = h * TN, dark = shade(col, -0.3);
+  px(0, 0, Wd, Hd, col);
+  ctx.fillStyle = dark;
+  for (let j = 2; j < Hd; j += 3) px(0, j, Wd, 1);
+  px(0, (Hd >> 1) - 1, Wd, 2, shade(col, 0.25));
+  px(0, 0, 1, Hd, dark); px(Wd - 1, 0, 1, Hd, dark); px(0, Hd - 1, Wd, 1, shade(col, -0.45));
+  for (const i of [3, Wd - 7]) { px(i, (Hd >> 1) - 6, 4, 5, '#8a3b2c'); px(i, (Hd >> 1) - 6, 4, 1, '#5a2a22'); }
+}
+
+function roofBar(c0, r0, w, h) {               // Georgia Theatre's rooftop bar
+  ox = c0 * T; oy = Y(r0 + h - 1);
+  const Wd = w * TN, Hd = h * TN;
+  px(2, 2, Wd - 4, Hd - 4, '#9a7350');
+  ctx.fillStyle = '#7d5b3e';
+  for (let j = 3; j < Hd - 2; j += 2) px(2, j, Wd - 4, 1);
+  ctx.fillStyle = '#e6e2d8';
+  px(2, 2, Wd - 4, 1); px(2, Hd - 3, Wd - 4, 1); px(2, 2, 1, Hd - 4); px(Wd - 3, 2, 1, Hd - 4);
+  for (let k = 0; k < 4; k++) {
+    const i = 5 + (k & 1) * (Wd >> 1), j = 5 + (k >> 1) * (Hd >> 1);
+    px(i - 2, j - 2, 6, 5, k & 1 ? '#d62839' : '#2a9d8f'); px(i, j, 2, 1, '#f7f3e8');
+  }
+  for (let i = 3; i < Wd - 3; i += 3) {
+    const j = (Hd >> 1) + ((i / 3) & 1);
+    px(i, j, 1, 1, '#ffe9a8');
+    glow(ox + i / RS, oy + j / RS, T * 0.3, '255,220,150');
+  }
+}
+
+function roofDeck(c0, r0, w, h) {              // top level of the deck, cars nosed into stalls
+  ox = c0 * T; oy = Y(r0 + h - 1);
+  const Wd = w * TN, Hd = h * TN;
+  px(0, 0, Wd, Hd, '#8d939a');
+  px(0, 0, Wd, 1, '#b5bbc2'); px(0, 0, 1, Hd, '#b5bbc2'); px(0, Hd - 1, Wd, 1, '#5f656c'); px(Wd - 1, 0, 1, Hd, '#5f656c');
+  for (let k = 0, j = 2; j + 6 < Hd; k++, j += TN) {
+    ctx.fillStyle = '#e6e4da';
+    for (let i = 2; i < Wd - 2; i += 5) px(i, j, 1, 6);
+    for (let i = 3; i + 3 < Wd - 2; i += 5) if (hash(i, k, 91) < 0.5) {
+      const col = CAR_COLORS[Math.floor(hash(k, i, 92) * CAR_COLORS.length)];
+      px(i, j, 3, 6, col); px(i, j + 2, 3, 2, shade(col, -0.35));
+    }
+  }
+  px(Wd - 8, Hd - 9, 7, 8, '#6d737a'); px(Wd - 7, Hd - 8, 5, 2, '#3d434b');
+}
+
+function churchRoof(c, r) {                    // First UMC: slate roof and a white steeple
+  ox = c * T; oy = Y(r + 1);
+  const n = TN, Hd = 2 * n, cx = n >> 1;
+  px(0, 0, n, Hd, '#6b6f78');
+  ctx.fillStyle = '#585c64';
+  for (let j = 2; j < Hd; j += 3) px(0, j, n, 1);
+  px(cx - 1, 0, 2, Hd, '#858a94');
+  px(cx - 4, Hd - 9, 8, 9, '#f2efe6'); px(cx + 3, Hd - 9, 1, 9, '#c9c4b8');
+  px(cx - 2, Hd - 7, 4, 3, '#3d4a5c');
+  px(cx - 3, Hd - 14, 6, 5, '#f2efe6'); px(cx + 2, Hd - 14, 1, 5, '#c9c4b8'); px(cx - 1, Hd - 13, 2, 3, '#3d4a5c');
+  const sp = Hd - 15;
+  for (let k = 0; k < sp; k++) { const w = Math.max(1, Math.round(5 * (1 - k / sp))); px(cx - (w >> 1), Hd - 15 - k, w, 1, k < 2 ? '#d8d3c6' : '#f2efe6'); }
+}
+
+function domeAt(c, r) {                        // City Hall's clock tower
+  ox = c * T; oy = Y(r + 1);
+  const cx = Math.floor(1.5 * TN), by = 2 * TN;
+  px(cx - 7, by - 3, 14, 3, '#cdbf9c');
+  px(cx - 6, by - 11, 12, 8, '#efe6cf'); px(cx + 4, by - 11, 2, 8, '#cdbf9c');
+  px(cx - 3, by - 10, 6, 6, '#1d1b2e'); px(cx - 2, by - 9, 4, 4, '#fdf6d8');
+  px(cx, by - 9, 1, 2, '#1d1b2e'); px(cx, by - 7, 2, 1, '#1d1b2e');
+  px(cx - 6, by - 12, 12, 1, '#ffffff');
+  px(cx - 5, by - 15, 10, 3, '#c9ccd1'); px(cx - 4, by - 17, 8, 2, '#c9ccd1'); px(cx - 2, by - 18, 4, 1, '#c9ccd1');
+  px(cx - 4, by - 15, 2, 2, '#eef0f3');
+  px(cx, by - 21, 1, 3, '#c9a227');
+  glow(ox + cx / RS, oy + (by - 7) / RS, T * 0.8, '255,240,200');
+}
+
+function arenaRoof(c0, r0, w, h) {
+  roofArea(c0, r0, w, h, '#5d5864');
+  const cx = (c0 + w / 2) * T, cy = Y(r0 + h - 1) + h * T / 2;
+  ellipse(cx, cy, w * T * 0.47, h * T * 0.45, '#b9bec4');
+  ellipse(cx, cy, w * T * 0.35, h * T * 0.33, '#cfd4d9');
+  ellipse(cx, cy, w * T * 0.18, h * T * 0.17, '#e3e7eb');
+}
+
+function smokestack(c, r, hgt) {               // foundry chimney rising off the roof
+  ox = c * T; oy = Y(r);
+  const cx = TN >> 1, by = TN;
+  px(cx - 3, by - hgt, 6, hgt, '#9c3f2f'); px(cx - 3, by - hgt, 2, hgt, '#b5523b');
+  px(cx - 4, by - hgt, 8, 2, '#5a2a22'); px(cx - 2, by - hgt, 4, 1, '#1d1b2e');
+}
+
+function marker(c, r) {                        // a historical marker on its post, tucked into the corner
+  ox = c * T; oy = Y(r);
+  const n = TN;
+  px(n - 4, n - 7, 1, 6, '#3d3f4b');
+  px(n - 7, n - 12, 7, 5, '#c9a227'); px(n - 6, n - 11, 5, 3, '#1f4d3a');
+  ctx.fillStyle = '#e9d58a';
+  px(n - 5, n - 10, 3, 1);
+}
+
+// ---------------------------------------------------------------- what goes where
+const ROW_MIX = [
+  [bShop, bCafe, bBooks, bRecords, bDiner, bShop, bBrick],   // Broad St, facing campus
+  [bBar, bBar, bBrick, bShop, bRecords, bCafe],               // Clayton St
+  [bBrick, bShop, bBar, bCafe, bBooks],                       // Washington St
+  [bBrick, bBrick, bShop, bCafe, bBar],                       // Hancock Ave
+  [bBrick, bShop, bBrick, bBooks],                            // Dougherty St
+];
+const LIVE_FN = new Set([bDiner, bBar, bTheater]);
+const MARKS = [   // c, r: west column and lap row of the facade; w tiles wide (h rows tall)
+  { c: 6, r: 19, w: 1, f: f40Watt, live: 1, glow: [[0.5, 0.4, 1.3, '255,240,170']] },
+  { c: 7, r: 19, w: 2, f: fFlicker, live: 1, glow: [[1, 0.35, 1.4, '127,232,255']] },
+  { c: 13, r: 19, w: 2, f: fMorton, glow: [[1, 0.6, 1.4, '255,190,130']] },
+  { c: 15, r: 19, w: 1, f: fChurch },
+  { c: 14, r: 12, w: 2, f: fGeorgia, live: 1, glow: [[1, 0.6, 1.8, '255,210,120'], [0.15, 0.2, 0.9, '255,160,80']] },
+  { c: 20, r: 12, w: 3, f: fDeck },
+  { c: 34, r: 12, w: 3, f: Wd => fOffice(Wd, '#9c5a45') },
+  { c: 20, r: 19, w: 3, f: fCityHall, glow: [[1.5, 0.4, 1.4, '255,230,170']] },
+  { c: 27, r: 19, w: 3, f: fPostOffice },
+  { c: 34, r: 19, w: 3, f: fCourthouse },
+  { c: 13, r: 26, w: 1, f: fCine, live: 1, glow: [[0.5, 0.35, 1.2, '255,220,140']] },
+  { c: 20, r: 26, w: 3, f: fHotel, glow: [[1.5, 0.3, 1.3, '255,245,220']] },
+  { c: 27, r: 26, w: 3, h: 2, f: fTower, glow: [[1.5, -0.5, 1.6, '255,214,120']] },
+  { c: 34, r: 33, w: 3, f: fWelcome, glow: [[1.5, 0.75, 1.1, '255,226,168']] },
+  { c: 43, r: 5, w: 2, f: Wd => fOffice(Wd, '#b9b2a2') },
+  { c: 43, r: 12, w: 2, f: fClassic, glow: [[1, 0.5, 1.5, '170,220,255']] },
+  { c: 43, r: 19, w: 2, f: fArena },
+  { c: 43, r: 26, w: 2, f: fFoundry, glow: [[1, 0.6, 1.2, '255,207,128']] },
+  { c: 43, r: 33, w: 2, f: fFoundry, glow: [[1, 0.6, 1.2, '255,207,128']] },
+];
+const ROOFS = {   // key: block row * 5 + block; called with the south-west roof tile
+  6: (c, r) => { roofArea(c, r, 3, 2); roofBar(c + 1, r, 2, 2); },
+  7: (c, r) => roofDeck(c, r, 3, 2),
+  11: (c, r) => { roofArea(c, r, 2, 2); churchRoof(c + 2, r); },
+  12: (c, r) => { roofArea(c, r, 3, 2, '#5d6870'); domeAt(c, r); },
+  13: (c, r) => roofArea(c, r, 3, 2, '#7a7f86'),
+  14: (c, r) => roofArea(c, r, 3, 2, '#68857a'),
+  18: (c, r) => roofArea(c, r + 1, 3, 1, '#77727f'),
+  24: (c, r) => houseRoof(c, r, 3, 2, '#4a5058'),
+};
+const markAt = (c, r) => MARKS.some(m => r >= m.r && r < m.r + (m.h || 1) && c >= m.c && c < m.c + m.w);
+
+function genericFacade(c, r, br) {
+  const mix = ROW_MIX[br], f = mix[Math.floor(hash(c, r, 54) * mix.length)];
+  const a = hash(c, r, 51), b = hash(c, r, 52), d = hash(c, r, 53);
+  const draw = () => { f(a, b, d); px(0, 0, 1, TN, 'rgba(0,0,0,0.28)'); };
+  at(c, r); draw();
+  if (LIVE_FN.has(f)) LIVE.push({ c, r, w: 1, draw });
+  if (f === bBar || f === bDiner || f === bCafe) glow((c + 0.5) * T, Y(r) + T * 0.7, T * 0.9, f === bBar ? (b < 0.5 ? '255,79,216' : '79,216,255') : '255,200,130');
+}
+
+function paintFacade(m) {
+  const h = m.h || 1, Wd = m.w * TN, Hd = h * TN;
+  const draw = () => { m.f(Wd, Hd); px(0, 0, 1, Hd, 'rgba(0,0,0,0.28)'); };
+  at(m.c, m.r + h - 1); draw();
+  if (m.live) LIVE.push({ c: m.c, r: m.r + h - 1, w: m.w, draw });
+  if (m.glow) for (const [dx, dy, rr, col] of m.glow) glow((m.c + dx) * T, Y(m.r) + dy * T, rr * T, col);
+}
+
+function paintBlocks() {
+  for (let br = 0; br < 5; br++) {
+    const r1 = BLOCK_R[br] + 1;
+    for (let b = 0; b < 5; b++) {
+      const c1 = BLOCK_C[b] + 1, spec = ROOFS[br * 5 + b];
+      if (spec) spec(c1, r1 + 1); else roofArea(c1, r1 + 1, 3, 2);
+      for (let c = c1; c < c1 + 3; c++) if (!markAt(c, r1)) genericFacade(c, r1, br);
+    }
+    houseRoof(0, r1 + 1, 2, 2, ['#5a4a42', '#4a5058', '#6b4f3a', '#556052', '#5a4a42'][br]);   // west: houses
+    at(0, r1); fHouse(2 * TN, br);
+    if (br === 2) arenaRoof(43, r1 + 1, 2, 2);                                              // east: Classic Center, foundry
+    else roofArea(43, r1 + 1, 2, 2, br === 1 ? '#8d939a' : br >= 3 ? '#5a4a48' : undefined);
+    if (br === 3) smokestack(44, r1 + 2, Math.round(TN * 1.6));
+  }
+  for (const m of MARKS) paintFacade(m);
+  marker(9, 15);                                                                           // Hot Corner
+}
+
+// ---------------------------------------------------------------- North Campus, painted once into its own canvas
+// Coming up the main walk: Old College at the back, the Chapel and its bell, Holmes-Hunter, the two literary
+// society halls, the fountain on Herty Field, then the iron fence and the Arch on Broad St. No school marks:
+// the Arch is bare iron and the halls carry no names.
+const CLIVE = [];   // animated campus pieces: { c, r: north row (its tile top is the origin), draw }
+
+function brickWall(i0, j0, w, h, base) {        // running bond
+  px(i0, j0, w, h, base);
+  ctx.fillStyle = shade(base, -0.16);
+  for (let j = j0 + 2; j < j0 + h; j += 3) px(i0, j, w, 1);
+  ctx.fillStyle = shade(base, -0.24);
+  for (let j = j0; j < j0 + h; j += 3) for (let i = i0 + ((j / 3) & 1 ? 1 : 3); i < i0 + w; i += 4) px(i, j, 1, 2);
+}
+function sash(i, j, w, h) {                      // white-framed sash window
+  px(i, j, w, h, '#f4f1ea');
+  px(i + 1, j + 1, w - 2, h - 2, '#2a3340');
+  if (w > 4) px(i + (w >> 1), j + 1, 1, h - 2, '#f4f1ea');
+  if (h > 4) px(i + 1, j + (h >> 1), w - 2, 1, '#f4f1ea');
+  px(i + 1, j + 1, 1, 1, '#6d8399');
+}
+function pediment(i0, w, h, c, edge) {           // stepped gable sitting on j = 0, rising h art px into the roof row
+  for (let k = 1; k <= h; k++) {
+    const inset = Math.round(k * w / (2 * (h + 1)));
+    px(i0 + inset, -k, w - 2 * inset, 1, k === h ? edge : c);
+    px(i0 + inset, -k, 1, 1, edge); px(i0 + w - inset - 1, -k, 1, 1, edge);
+  }
+  px(i0, -1, w, 1, edge);
+}
+function templeFront(Wd, k, wall, stone, mid) {  // entablature, a row of columns, a shadowed porch, steps
+  const n = TN, ej = tf(0.16), sj = n - tf(0.14), dw = Math.max(3, tf(0.22));
+  px(0, ej, Wd, sj - ej, wall);
+  px((Wd - dw) >> 1, ej + tf(0.2), dw, sj - ej - tf(0.2), '#3a2a22');
+  columns(Wd, ej, sj, k, stone, mid);
+  px(0, 0, Wd, ej, stone); px(0, 0, Wd, 1, '#ffffff'); px(0, ej - 1, Wd, 1, mid);
+  px(0, sj, Wd, n - sj, '#cfc9bb'); px(0, sj, Wd, 1, '#e8e3d6'); px(0, n - 1, Wd, 1, '#a9a397');
+}
+function hall(Wd, wall, brick, portico) {        // two floors of sash windows, a fanlight door, maybe a portico
+  const n = TN, cj = tf(0.12), w1 = Math.max(3, tf(0.22)), h1 = Math.max(3, tf(0.24)), cx = Wd >> 1;
+  if (brick) brickWall(0, 0, Wd, n, wall);
+  else { px(0, 0, Wd, n, wall); ctx.fillStyle = shade(wall, -0.07); for (let j = 3; j < n; j += 4) px(0, j, Wd, 1); }
+  px(0, 0, Wd, cj, '#f4f1ea'); px(0, cj - 1, Wd, 1, '#c9c3b6');
+  const k = Math.max(2, Math.floor(Wd / (w1 + 3))), gap = (Wd - k * w1) / (k + 1);
+  for (let i = 0; i < k; i++) {
+    const x = Math.round(gap + i * (w1 + gap));
+    sash(x, cj + 2, w1, h1);
+    if (Math.abs(x + w1 / 2 - cx) > w1 + 1) sash(x, cj + h1 + 4, w1, h1);
+  }
+  const dw = Math.max(3, tf(0.26)), dj = n - tf(0.42);
+  px(cx - (dw >> 1) - 1, dj - 2, dw + 2, n - dj + 2, '#f4f1ea');
+  px(cx - (dw >> 1), dj - 1, dw, 1, '#9fb6c8');
+  px(cx - (dw >> 1), dj, dw, n - dj, '#2f3a2c');
+  px(0, n - 1, Wd, 1, shade(wall, -0.35));
+  if (portico) {
+    const pw = Math.max(4 * 3 + 2, Math.round(Wd * 0.36)), p0 = (Wd - pw) >> 1, keep = ox;
+    ox += p0 / RS;
+    templeFront(pw, portico, '#5a5248', '#f4f1ea', '#c9c3b6');
+    pediment(0, pw, tf(0.34), '#f4f1ea', '#c9c3b6');
+    ox = keep;
+  }
+}
+
+// ---------------------------------------------------------------- roofs behind the facades
+function roofNS(c0, r0, w, h, col) {             // ridge runs north-south: east slope in shade, standing seams
+  ox = c0 * T; oy = Y(r0 + h - 1);
+  const Wd = w * TN, Hd = h * TN, half = Wd >> 1;
+  px(0, 0, half, Hd, col); px(half, 0, Wd - half, Hd, shade(col, -0.22));
+  ctx.fillStyle = 'rgba(0,0,0,0.12)';
+  for (let i = 2; i < Wd; i += 3) if (Math.abs(i - half) > 1) px(i, 0, 1, Hd);
+  px(half - 1, 0, 2, Hd, shade(col, 0.22));
+  px(0, 0, Wd, 1, shade(col, -0.4)); px(0, 0, 1, Hd, shade(col, -0.3)); px(Wd - 1, 0, 1, Hd, shade(col, -0.45));
+}
+function roofEW(c0, r0, w, h, col, chim) {       // ridge runs east-west: the south slope catches the sun
+  ox = c0 * T; oy = Y(r0 + h - 1);
+  const Wd = w * TN, Hd = h * TN, mid = Hd >> 1;
+  px(0, 0, Wd, mid, shade(col, -0.22)); px(0, mid, Wd, Hd - mid, col);
+  ctx.fillStyle = 'rgba(0,0,0,0.13)';
+  for (let j = 2; j < Hd; j += 3) if (Math.abs(j - mid) > 1) px(0, j, Wd, 1);
+  px(0, mid - 1, Wd, 2, shade(col, 0.2));
+  px(0, 0, Wd, 1, shade(col, -0.4)); px(0, 0, 1, Hd, shade(col, -0.3)); px(Wd - 1, 0, 1, Hd, shade(col, -0.45));
+  if (chim) for (const i of [3, Wd - 7]) { px(i, mid - 5, 4, 6, chim); px(i, mid - 5, 4, 1, shade(chim, -0.35)); px(i + 3, mid - 4, 1, 5, shade(chim, -0.25)); }
+}
+
+// ---------------------------------------------------------------- the pieces
+function bellTower(c, r) {                       // the Chapel bell in its own little white tower
+  at(c, r);
+  const n = TN, cx = n >> 1, top = -tf(0.7), lj = top + 5, bj = top + 6;
+  px(2, n - 2, n - 2, 2, 'rgba(0,0,0,0.22)');
+  for (const i of [2, n - 4]) { px(i, lj, 2, n - lj - 1, '#f4f1ea'); px(i + 1, lj, 1, n - lj - 1, '#c9c3b6'); }
+  px(2, n - 6, n - 4, 1, '#c9c3b6'); px(2, lj, n - 4, 1, '#c9c3b6');
+  for (let k = 0; k < 5; k++) { const ins = 4 - k; px(1 + ins, top + k, n - 2 - 2 * ins, 1, k === 4 ? '#3f4850' : '#5d6870'); }
+  px(cx, top - 2, 1, 2, '#c9a227');
+  px(cx - 1, bj, 3, 1, '#8a6128'); px(cx - 2, bj + 1, 5, 2, '#b0813a'); px(cx - 3, bj + 3, 7, 1, '#8a6128');
+  px(cx - 1, bj + 1, 1, 1, '#e0b868'); px(cx, bj + 4, 1, 1, '#3a2a18');
+  px(cx, bj + 5, 1, n - bj - 7, '#d9c9a5');
+}
+
+function fountain(c, r) {                        // the fountain on Herty Field (2 x 2, r is its south row)
+  ox = c * T; oy = Y(r + 1);
+  const cx = ox + T, cy = oy + T;
+  ellipse(cx, cy, T * 0.98, T * 0.9, '#d8ceb4');
+  ellipse(cx + T * 0.06, cy + T * 0.08, T * 0.88, T * 0.74, 'rgba(0,0,0,0.2)');
+  ellipse(cx, cy, T * 0.86, T * 0.72, '#8f897d');
+  ellipse(cx, cy, T * 0.82, T * 0.68, '#c9c3b6');
+  ellipse(cx, cy, T * 0.72, T * 0.58, '#3f86b8');
+  CLIVE.push({ c, r: r + 1, draw: fountainWater });
+}
+function fountainWater() {                       // per frame: ripples running out, the jet and its spray
+  const cx = ox + T, cy = oy + T, q = 1 / RS;
+  ellipse(cx, cy, T * 0.72, T * 0.58, '#3f86b8');
+  for (let k = 0; k < 2; k++) {
+    const ph = (time * 0.55 + k * 0.5) % 1, rx = T * (0.26 + ph * 0.42);
+    ellipse(cx, cy, rx, rx * 0.8, ph < 0.75 ? '#62aedc' : '#4f9acb');
+    ellipse(cx, cy, rx - q, rx * 0.8 - q, '#3f86b8');
+  }
+  ellipse(cx, cy, T * 0.2, T * 0.16, '#8f897d');
+  ellipse(cx, cy - T * 0.06, T * 0.17, T * 0.13, '#c9c3b6');
+  ellipse(cx, cy - T * 0.2, T * 0.26, T * 0.1, '#b9b3a6');
+  ellipse(cx, cy - T * 0.21, T * 0.2, T * 0.07, '#62aedc');
+  ctx.fillStyle = '#d9f1ff';
+  const jh = T * (0.42 + 0.04 * Math.sin(time * 9));
+  fr(cx - q, cy - T * 0.2 - jh, 2 * q, jh);
+  for (let k = 0; k < 6; k++) {
+    const ph = (time * 1.4 + k / 6) % 1, a = (k / 6) * Math.PI * 2 + 0.4;
+    const d = T * 0.3 * ph, x = cx + Math.cos(a) * d, y = cy - T * 0.2 - jh + T * 0.9 * ph * ph - T * 0.15 * ph + Math.sin(a) * d * 0.4;
+    ctx.fillStyle = ph < 0.6 ? '#ffffff' : '#b6e2ff';
+    fr(x, y, q, q);
+  }
+}
+
+function ironFence(c, r) {                       // the old iron fence along Broad St
+  at(c, r);
+  const n = TN, t = tf(0.24), b = n - 3;
+  px(0, b, n, 3, '#8f897d'); px(0, b, n, 1, '#b9b3a6');
+  px(0, t + 1, n, 1, '#24262c'); px(0, b - 2, n, 1, '#24262c');
+  for (let i = 1; i < n; i += 3) { px(i, t, 1, b - t, '#2c2f36'); px(i, t - 1, 1, 1, '#555b66'); }
+  if (c % 7 === 3) { px((n >> 1) - 2, t - 3, 4, b - t + 3, '#9c968a'); px((n >> 1) - 2, t - 3, 4, 1, '#c9c3b6'); px((n >> 1) - 1, t - 4, 2, 1, '#2c2f36'); }
+}
+function gatePiers(c, r) {                       // an open gate: granite piers, iron lanterns on top
+  at(c, r);
+  const n = TN, t = tf(0.12);
+  for (const i of [0, n - 3]) {
+    px(i, t, 3, n - t, '#a9a397'); px(i, t, 3, 1, '#d8d2c4'); px(i + 2, t + 1, 1, n - t - 1, '#8a8478');
+    px(i, t - 3, 3, 3, '#24262c'); px(i + 1, t - 2, 1, 1, '#ffe7a6');
+  }
+}
+
+function theArch() {                             // cast iron, three columns, an arched crest; no lettering
+  ox = 24 * T; oy = Y(-2);
+  const Wd = 2 * TN, n = TN, iron = '#2b2e35', hi = '#4d525c', lo = '#1a1c21';
+  const base = n - 3, top = -tf(0.8), band = top + tf(0.32), lint = band + 3;
+  px(2, n - 1, Wd - 2, 1, 'rgba(0,0,0,0.25)');
+  for (const x of [2, (Wd >> 1) - 1, Wd - 5]) {
+    px(x - 1, base, 5, 3, '#9c968a'); px(x - 1, base, 5, 1, '#c9c3b6');
+    px(x, lint, 3, base - lint, iron); px(x, lint, 1, base - lint, hi); px(x + 2, lint, 1, base - lint, lo);
+    px(x - 1, lint, 5, 1, hi); px(x - 1, base - 1, 5, 1, lo);
+  }
+  px(0, band, Wd, 3, iron); px(0, band, Wd, 1, hi); px(0, band + 2, Wd, 1, lo);
+  const ah = band - top;
+  for (let i = 1; i < Wd - 1; i++) {             // the crest: a shallow arc over an iron lattice
+    const u = (i + 0.5) / Wd * 2 - 1, hgt = Math.round(ah * Math.sqrt(Math.max(0, 1 - u * u)));
+    for (let j = band - hgt + 1; j < band; j++) if ((i + j) % 2 === 0) px(i, j, 1, 1, iron);
+    px(i, band - hgt, 1, 1, hgt > 0 ? hi : iron); px(i, band - hgt + 1, 1, 1, iron);
+  }
+  px(0, band - 2, 2, 2, iron); px(Wd - 2, band - 2, 2, 2, iron);
+  px((Wd >> 1) - 1, top - 2, 2, 2, '#4d525c');
+}
+
+function magnolia(cx, cy) {                      // southern magnolia: dark, glossy, a few white blooms
+  ellipse(cx + T * 0.07, cy + T * 0.14, T * 0.34, T * 0.18, 'rgba(0,0,0,0.25)');
+  ctx.fillStyle = '#4a3a2e'; fr(cx - T * 0.04, cy, T * 0.08, T * 0.2);
+  ellipse(cx, cy - T * 0.02, T * 0.38, T * 0.2, '#123020');
+  ellipse(cx, cy - T * 0.03, T * 0.36, T * 0.18, '#1f5a32');
+  ellipse(cx, cy - T * 0.2, T * 0.29, T * 0.16, '#24683a');
+  ellipse(cx, cy - T * 0.35, T * 0.19, T * 0.12, '#2e7a45');
+  ellipse(cx, cy - T * 0.46, T * 0.09, T * 0.07, '#3a8d52');
+  ctx.fillStyle = '#fbf7ea';
+  const q = 1 / RS;
+  for (let k = 0; k < 4; k++) fr(cx + (hash(cx, cy, k) - 0.5) * T * 0.5, cy - T * (0.06 + hash(cy, cx, k) * 0.36), q, q);
+}
+
+function campusTree(c, r) {
+  const x = (c + 0.5) * T, y = Y(r) + T * 0.55;
+  if (hash(c, r, 77) < 0.3) magnolia(x, y); else drawTree(x, y);
+}
+
+function paintCampusBldg(b) {
+  const Wd = b.w * TN, rr = b.r + 1, rh = b.h - 1;
+  if (b.id === 'chapel') {                       // the Chapel, 1832: six columns and a big pediment
+    roofNS(b.c, rr, b.w, rh, '#8e959c');
+    at(b.c, b.r); templeFront(Wd, 6, '#5a5248', '#f6f3ec', '#cfc8b8');
+    pediment(0, Wd, tf(0.6), '#f6f3ec', '#bdb6a6');
+    px((Wd >> 1) - 2, -tf(0.3), 4, 3, '#2a3340'); px((Wd >> 1) - 1, -tf(0.3), 2, 1, '#6d8399');
+  } else if (b.id === 'bell') bellTower(b.c, b.r);
+  else if (b.id === 'oldcollege') {              // Old College, 1806: plain red brick, four chimneys
+    roofEW(b.c, rr, b.w, rh, '#5d5864', '#8a3b2c');
+    ox = b.c * T; oy = Y(rr + rh - 1);
+    const mid = (rh * TN) >> 1;
+    for (const i of [Math.round(Wd * 0.33), Math.round(Wd * 0.62)]) { px(i, mid - 5, 4, 6, '#8a3b2c'); px(i, mid - 5, 4, 1, '#5a2a22'); }
+    at(b.c, b.r); hall(Wd, '#a8473a', true, 0);
+  } else if (b.id === 'holmes') {                // Holmes-Hunter: cream stucco, a columned center
+    roofEW(b.c, rr, b.w, rh, '#6f7a7e');
+    at(b.c, b.r); hall(Wd, '#eadfc4', false, 4);
+  } else if (b.id === 'demos') {                 // Demosthenian Hall: small, peach stucco, a fanlight door
+    roofEW(b.c, rr, b.w, rh, '#5d5864', '#9a5a44');
+    at(b.c, b.r); hall(Wd, '#e7b08c', false, 0);
+  } else if (b.id === 'phikappa') {              // Phi Kappa Hall: a small temple across the walk
+    roofNS(b.c, rr, b.w, rh, '#7d848b');
+    at(b.c, b.r); templeFront(Wd, 4, '#5a5248', '#f2ead6', '#c9bfa5');
+    pediment(0, Wd, tf(0.42), '#f2ead6', '#b5aa90');
+  } else if (b.id === 'fountain') fountain(b.c, b.r);
+  else {                                         // the other halls: brick with white trim
+    const v = Math.floor(hash(b.c, b.r, 5) * 3);
+    roofEW(b.c, rr, b.w, rh, ['#5d5864', '#4a5058', '#5a4a48'][v], '#8a3b2c');
+    at(b.c, b.r); hall(Wd, ['#a8473a', '#b5523b', '#9c4535'][v], true, b.w >= 4 ? 4 : 0);
+  }
+}
+
+function paintCampus() {
+  CLIVE.length = 0;
+  for (let c = 0; c < WCOLS; c++) {
+    const k = tileKind(c, -2);
+    if (k === 'fence') ironFence(c, -2); else if (k === 'gate') gatePiers(c, -2);
+  }
+  theArch();
+  for (const x of [24.14, 25.86]) for (const r of [-4, -7]) lampPost(x * T, YW(r + 0.2));
+  marker(22, -5);
+  for (let r = -3; r >= -CAMPUS; r--) {          // north to south so nearer things overlap what is behind
+    for (const b of CAMPUS_BLDGS) if (b.r + b.h - 1 === r) paintCampusBldg(b);
+    for (let c = 0; c < WCOLS; c++) if (tileKind(c, r) === 'tree') campusTree(c, r);
   }
 }
 
@@ -925,12 +1857,6 @@ function bRecords(a, b, d) {
 
 const BUILDINGS = [bShop, bShop, bShop, bBrick, bBrick, bTheater, bDiner, bBar, bCivic, bDeck, bCafe, bBooks, bRecords];
 
-function drawStore(c, y, top) {
-  ox = sx(c); oy = top;
-  BUILDINGS[Math.floor(hash(y, c, 54) * BUILDINGS.length)](hash(y, c, 51), hash(y, c, 52), hash(y, c, 53));
-  px(0, 0, 1, TN, 'rgba(0,0,0,0.28)');
-}
-
 function drawTree(cx, cy) {
   const o = 1 / RS;
   ctx.fillStyle = '#6b5443';
@@ -967,21 +1893,6 @@ function drawBench(cx, cy) {
 
 // ---------------------------------------------------------------- vehicles (drawn facing +x, mirrored for leftbound lanes)
 const OUTLINE = '#15131f';
-
-function drawTraffic(r, y) {
-  const cy = snap(sy(y + 0.5));
-  for (const v of r.vehicles) {
-    const x0 = vehX(r, v);
-    if (x0 > visR + 0.5 || x0 + v.len < visL - 0.5) continue;
-    ctx.save();
-    ctx.translate(snap(sx(x0 + v.len / 2)), cy);   // whole art pixels, so the sprite stays on the grid
-    if (r.dir < 0) ctx.scale(-1, 1);
-    if (v.kind === 'bus') drawBus(v);
-    else if (v.kind === 'cop') drawCop(v);
-    else drawCar(v);
-    ctx.restore();
-  }
-}
 
 function drawWheels(L, hw, xs) {
   ctx.fillStyle = '#121418';
@@ -1076,26 +1987,6 @@ function drawCop(v) {
   drawLights(L, Wd, cy);
 }
 
-function drawCopWarnings(yb, yt) {
-  const red = Math.floor(time * 8) % 2 === 0, q = 1 / RS, col = red ? 'rgba(255,40,60,0.3)' : 'rgba(50,110,255,0.3)';
-  for (let y = yb; y <= yt; y++) {
-    const r = rows.get(y);
-    if (!r || r.type !== 'cop' || r.timer > 1.2) continue;
-    const top = snap(sy(y + 1)), R = T * 1.6;
-    ctx.fillStyle = col;
-    for (let k = 1; k <= 4; k++) {          // four hard-edged bands instead of a soft gradient
-      const w = R * k / 4;
-      if (r.dir > 0) fr(-40, top, 40 + w, T); else fr(W - w, top, w + 40, T);
-    }
-    if (red) {                               // blinking "!" at the edge the cop will come from
-      const ex = r.dir > 0 ? 4 * q : W - 6 * q, j = Math.floor(TN / 2) - 4;
-      ctx.fillStyle = '#ffffff';
-      fr(ex, top + j * q, 2 * q, 5 * q);
-      fr(ex, top + (j + 6) * q, 2 * q, 2 * q);
-    }
-  }
-}
-
 // ---------------------------------------------------------------- player (drawn facing up, rotated to face direction)
 function drawStudent(u) {
   const q = 1 / RS;
@@ -1181,30 +2072,293 @@ function drawParticles() {
   }
 }
 
+// ---------------------------------------------------------------- world to screen
+// World x counts columns from the west, world y counts rows up from Broad St. The camera position is
+// rounded to whole art pixels so the pre-painted map and everything drawn over it stay on one grid.
+let camXpx = 0, camYpx = 0, shX = 0, shY = 0;
+const sx = x => (x * TN - camXpx) / RS;
+const sy = y => (lo.height - y * TN + camYpx) / RS;
+const sc = () => Math.max(1, Math.round(TN / 16));     // art px per "sprite px" for the small props
+const visLaps = () => [Math.max(0, lapOf(drawCY - 1)), lapOf(drawCY + rowsVis + 1)];
+
+function blitMap(cv, L) {                               // one lap canvas, or the campus when L is -1
+  const top = L < 0 ? lo.height + camYpx : lo.height - ((L + 1) * LAP * TN - camYpx);
+  ctx.drawImage(cv, shX - camXpx, shY + top);
+}
+
+// ---------------------------------------------------------------- sidewalk clutter
+function oCone() {
+  const n = TN, s = sc(), m = n >> 1, by = n - 3 * s;
+  px(m - 4 * s, by + 2 * s, 10 * s, s, 'rgba(0,0,0,0.28)');
+  px(m - 5 * s, by, 10 * s, 2 * s, '#a8360c');
+  for (let j = 0; j < 9; j++) {
+    const w = (1 + j) * s, x = m - Math.floor(w / 2), y = by - (9 - j) * s;
+    px(x, y, w, s, j === 4 || j === 5 ? '#f4f1ea' : '#f26b1d');
+    if (j > 1) px(x + w - s, y, s, s, j === 4 || j === 5 ? '#cfc9bb' : '#c8501a');
+  }
+}
+
+function oBarrier() {
+  const n = TN, s = sc(), y0 = n - 10 * s;
+  px(2 * s, n - 2 * s, n - 3 * s, s, 'rgba(0,0,0,0.25)');
+  ctx.fillStyle = '#d9d4c7';
+  px(3 * s, y0 + 3 * s, s, 7 * s); px(n - 4 * s, y0 + 3 * s, s, 7 * s);
+  px(2 * s, n - 3 * s, 3 * s, s); px(n - 5 * s, n - 3 * s, 3 * s, s);
+  px(s, y0, n - 2 * s, 4 * s, '#f4f1ea');
+  ctx.fillStyle = '#e8551c';
+  for (let j = 0; j < 4; j++) for (let i = -8 * s + j * s; i < n; i += 5 * s) {   // diagonal stripes
+    const a = Math.max(s, i), b = Math.min(n - s, i + 2 * s);
+    if (b > a) px(a, y0 + j * s, b - a, s);
+  }
+  px(s, y0 + 4 * s, n - 2 * s, s, '#8f8b80');
+  px((n >> 1) - s, y0 - 2 * s, 2 * s, 2 * s, Math.floor(time * 2.5) % 2 ? '#8a6a1a' : '#ffcf3f');   // blinker
+}
+
+function oPlanter(c, r) {
+  const n = TN, s = sc(), m = n >> 1, q = s / RS;
+  px(3 * s, n - 2 * s, n - 5 * s, s, 'rgba(0,0,0,0.25)');
+  px(4 * s, n - 7 * s, n - 8 * s, 5 * s, '#a3543e');
+  px(n - 5 * s, n - 7 * s, s, 5 * s, '#7f3a2b');
+  px(3 * s, n - 8 * s, n - 6 * s, 2 * s, '#c06a4e');
+  const cx = ox + m / RS, cy = oy + (n - 12 * s) / RS;
+  circle(cx, cy, 5 * q, '#2a6b33');
+  circle(cx - q, cy - q, 4 * q, '#3e9a47');
+  circle(cx - 2 * q, cy - 2 * q, 2 * q, '#5cb85c');
+  for (let k = 0; k < 4; k++) px(m - 4 * s + Math.floor(hash(c, r, 40 + k) * 8) * s, n - 16 * s + Math.floor(hash(c, r, 50 + k) * 7) * s, s, s, k & 1 ? '#ff6b8a' : '#ffd23f');
+}
+
+function oScooter(c, r) {                               // a rental scooter left on its kickstand
+  const n = TN, s = sc(), col = hash(c, r, 5) < 0.5 ? '#2bb673' : '#f2c230';
+  px(2 * s, n - 2 * s, n - 4 * s, s, 'rgba(0,0,0,0.25)');
+  px(5 * s, n - 3 * s, s, 2 * s, '#3a3d46');
+  px(2 * s, n - 5 * s, 3 * s, 3 * s, '#15131f'); px(n - 5 * s, n - 5 * s, 3 * s, 3 * s, '#15131f');
+  px(3 * s, n - 4 * s, s, s, '#8a8f98'); px(n - 4 * s, n - 4 * s, s, s, '#8a8f98');
+  px(4 * s, n - 6 * s, n - 8 * s, 2 * s, col);
+  px(n - 5 * s, n - 15 * s, 2 * s, 10 * s, '#3a3d46');
+  px(n - 7 * s, n - 15 * s, 6 * s, s, '#15131f');
+  px(n - 5 * s, n - 12 * s, 2 * s, s, col);
+  px(n - 3 * s, n - 11 * s, s, s, '#fff4c4');
+}
+
+function oPatio(c, r) {                                 // a cafe table with an umbrella
+  const n = TN, s = sc(), m = n >> 1, aw = AWNINGS[Math.floor(hash(c, r, 9) * AWNINGS.length)];
+  px(s, n - 2 * s, n - 2 * s, s, 'rgba(0,0,0,0.22)');
+  ctx.fillStyle = '#2a2d33';
+  px(s, n - 8 * s, 2 * s, 6 * s); px(s, n - 4 * s, 4 * s, s);
+  px(n - 3 * s, n - 8 * s, 2 * s, 6 * s); px(n - 5 * s, n - 4 * s, 4 * s, s);
+  px(m - s, n - 15 * s, s, 12 * s, '#cfc9bb');
+  px(m - 4 * s, n - 7 * s, 8 * s, 2 * s, '#ece7da');
+  px(m - 4 * s, n - 5 * s, 8 * s, s, '#b9b3a6');
+  const rows = [5, 9, 12, 14], y0 = n - 18 * s;
+  rows.forEach((w, j) => {
+    const a = m - Math.ceil(w / 2) * s, b = a + w * s, y = y0 + j * s;
+    px(a, y, b - a, s, aw[0]);
+    for (let k = -6; k <= 6; k += 4) {
+      const p = Math.max(a, m + k * s), e = Math.min(b, m + (k + 2) * s);
+      if (e > p) px(p, y, e - p, s, aw[1]);
+    }
+  });
+  for (let i = m - 7 * s; i < m + 7 * s; i += 2 * s) px(i, y0 + 4 * s, s, s, aw[0]);   // scalloped hem
+}
+
+const OBST_DRAW = {
+  cone: oCone, barrier: oBarrier, planter: oPlanter, scooter: oScooter, patio: oPatio,
+  bench: () => drawBench(ox + T / 2, oy + T * 0.62),
+};
+function drawObstacles(x0, x1, y0, y1) {
+  const list = [];
+  for (const [k, t] of obst) {
+    const r = Math.floor(k / 64), c = k - r * 64;
+    if (c >= x0 - 1 && c <= x1 && r >= y0 - 1 && r <= y1) list.push([c, r, t]);
+  }
+  list.sort((a, b) => b[1] - a[1]);                     // north first, so nearer props overlap farther ones
+  for (const [c, r, t] of list) { ox = sx(c); oy = sy(r + 1); OBST_DRAW[t](c, r); }
+}
+
+// ---------------------------------------------------------------- traffic
+function drawVehicles(x0, x1, y0, y1) {
+  const out = [];
+  const one = (car, ln) => {
+    const p = carPose(car, ln);
+    if (p.x < x0 || p.x > x1 || p.y < y0 || p.y > y1) return;
+    const X = snap(sx(p.x)), Yp = snap(sy(p.y));
+    ctx.save();
+    ctx.translate(X, Yp);
+    ctx.rotate(p.a);
+    if (Math.cos(p.a) < -0.01) ctx.scale(1, -1);       // westbound: keep the sprite's lit side up
+    if (car.kind === 'bus') drawBus(car); else if (car.kind === 'cop') drawCop(car); else drawCar(car);
+    ctx.restore();
+    out.push({ X, Y: Yp, a: p.a, car });
+  };
+  for (const ln of hLanes.values()) if (ln.row >= y0 - 1 && ln.row <= y1) for (const car of ln.cars) one(car, ln);
+  for (const ln of vLanes) if (ln.c >= x0 - 1 && ln.c <= x1) for (const car of ln.cars) one(car, ln);
+  for (const ln of colLanes.values()) for (const car of ln.cars) one(car, ln);
+  return out;
+}
+
+// ---------------------------------------------------------------- the gameday crowd
+// Seen from behind as they surge north: shirts in red, black and white, caps, arms up, shakers and flags.
+// No logos or lettering anywhere, just colors.
+const FAN_SHIRT = ['#c41e3a', '#c41e3a', '#c41e3a', '#9e1530', '#1c1b20', '#1c1b20', '#f1efe8', '#7d828c'];
+const FAN_SKIN = ['#f1c7a0', '#e0ac7e', '#c68b5e', '#9a6440', '#6b4129'];
+const FAN_HAIR = ['#2a1d14', '#4a3020', '#141414', '#b8873c', '#6b3a1e'];
+
+function fan(cx, cy, h, h2, front) {
+  const u = T, q = 1 / RS;
+  const shirt = FAN_SHIRT[Math.floor(h * 97) % FAN_SHIRT.length], skin = FAN_SKIN[Math.floor(h2 * 5)];
+  ctx.fillStyle = OUTLINE; fr(cx - u * 0.2 - q, cy - u * 0.04 - q, u * 0.4 + 2 * q, u * 0.26 + 2 * q);
+  ctx.fillStyle = shirt; fr(cx - u * 0.2, cy - u * 0.04, u * 0.4, u * 0.26);
+  if (h2 > 0.8) { ctx.fillStyle = shirt === '#1c1b20' ? '#c41e3a' : '#1c1b20'; fr(cx - u * 0.2, cy + u * 0.06, u * 0.4, u * 0.05); }
+  if (front || h2 > 0.55) {                             // arms up, pumping
+    const w = Math.sin(time * 10 + h * 30) > 0 ? u * 0.07 : 0;
+    ctx.fillStyle = skin;
+    fr(cx - u * 0.28, cy - u * 0.3 - w, u * 0.07, u * 0.3);
+    fr(cx + u * 0.21, cy - u * 0.37 + w, u * 0.07, u * 0.3);
+    if (h > 0.45) {
+      const pc = h > 0.72 ? '#f1efe8' : '#c41e3a';
+      circle(cx - u * 0.25, cy - u * 0.34 - w, u * 0.1, pc);
+      circle(cx + u * 0.25, cy - u * 0.41 + w, u * 0.1, pc);
+    }
+  }
+  ctx.fillStyle = skin; fr(cx - u * 0.1, cy - u * 0.2, u * 0.2, u * 0.19);
+  if (h2 < 0.32) {                                      // ball cap, worn backwards
+    ctx.fillStyle = h2 < 0.18 ? '#c41e3a' : '#1c1b20';
+    fr(cx - u * 0.11, cy - u * 0.23, u * 0.22, u * 0.14);
+    fr(cx - u * 0.06, cy - u * 0.09, u * 0.12, u * 0.05);
+  } else {
+    ctx.fillStyle = FAN_HAIR[Math.floor(h * 13) % FAN_HAIR.length];
+    fr(cx - u * 0.1, cy - u * 0.22, u * 0.2, u * 0.13);
+  }
+}
+
+function drawCrowd() {
+  if (!creepOn && creepY <= drawCY) return;
+  const fy = sy(creepY), bottom = sy(drawCY - 1), u = T, q = 1 / RS;
+  if (fy > bottom) return;
+  ctx.fillStyle = '#2b0c14';
+  fr(-u, snap(fy + u * 0.15), W + 2 * u, bottom - fy);
+  const DX = 0.5, DY = 0.4, n = Math.min(24, Math.ceil((creepY - drawCY + 1.2) / DY));
+  const i0 = Math.floor((drawCX - 1) / DX), i1 = Math.ceil((drawCX + viewCols + 1) / DX);
+  for (let j = n; j >= 0; j--) {
+    const wy = creepY - 0.18 - j * DY;
+    for (let i = i0; i <= i1; i++) {
+      const h = hash(i, j, 701);
+      if (j > 0 && h < 0.05) continue;
+      const wx = (i + (j & 1) * 0.5) * DX + (hash(i, j, 702) - 0.5) * 0.16;
+      const hop = Math.sin(time * 8 + h * 40) > 0.55 ? u * 0.06 : 0;
+      fan(snap(sx(wx)), snap(sy(wy) - hop), h, hash(i, j, 703), j < 2);
+    }
+    if (j === 2) for (let i = i0; i <= i1; i++) {        // flags on poles, waving
+      if (i % 7 || hash(i, 9, 704) > 0.7) continue;
+      const fx = snap(sx(i * DX)), top = snap(sy(wy) - u * 1.15), red = hash(i, 8, 704) < 0.6;
+      ctx.fillStyle = '#d8d4c8'; fr(fx, top, Math.max(q, u * 0.05), u * 1.1);
+      for (let k = 0; k < 6; k++) {
+        const x = fx + q + k * u * 0.1, y = snap(top + Math.sin(time * 7 + k * 0.9 + i) * u * 0.05);
+        ctx.fillStyle = red ? '#c41e3a' : '#1c1b20'; fr(x, y, u * 0.1, u * 0.36);
+        ctx.fillStyle = red ? '#1c1b20' : '#f1efe8'; fr(x, y + u * 0.13, u * 0.1, u * 0.08);
+      }
+    }
+  }
+  const CONF = ['#c41e3a', '#f1efe8', '#1c1b20', '#ffd23f'];
+  for (let k = 0; k < 16; k++) {                       // confetti blowing out ahead of them
+    const t0 = time * 0.7 + hash(k, 3, 705), t = t0 % 1, g = Math.floor(t0);
+    const wx = drawCX + hash(k, g, 706) * viewCols + Math.sin(time * 3 + k) * 0.2, wy = creepY - 0.1 + t * 1.5;
+    ctx.globalAlpha = 1 - t;
+    ctx.fillStyle = CONF[k & 3];
+    fr(snap(sx(wx)), snap(sy(wy)), 2 * q, (k & 1 ? 1 : 2) * q);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawCrowdWarning() {                           // the screen edge flashes red when they're close
+  if (state !== 'play' || !creepOn) return;
+  const py = lerp(player.fromRow, player.row, easeOut(player.t)) + 0.5, d = py - creepY;
+  if (d > 3) return;
+  const k = clamp(1 - (d - 0.6) / 2.4, 0, 1);
+  if (Math.floor(time * (4 + 6 * k)) % 2) return;
+  ctx.setTransform(RS, 0, 0, RS, 0, 0);
+  const th = T * 0.22;
+  for (let b = 0; b < 3; b++) {
+    ctx.fillStyle = 'rgba(255,40,60,' + ((0.16 + 0.3 * k) / (b + 1)).toFixed(3) + ')';
+    fr(0, H - th * (b + 1), W, th);
+    fr(0, H * 0.45 + b * th, th * (3 - b), H);
+    fr(W - th * (3 - b), H * 0.45 + b * th, th * (3 - b), H);
+  }
+}
+
+// ---------------------------------------------------------------- time of day: each lap of downtown is later in the day
+const SKY = [[0.5, 255, 190, 120, 0], [1.25, 255, 150, 80, 0.24], [2.1, 130, 90, 180, 0.42], [2.9, 46, 54, 130, 0.6]];
+function skyNow(f) {
+  if (f <= SKY[0][0]) return SKY[0];
+  for (let i = 1; i < SKY.length; i++) if (f <= SKY[i][0]) {
+    const a = SKY[i - 1], b = SKY[i], k = (f - a[0]) / (b[0] - a[0]);
+    return a.map((v, j) => lerp(v, b[j], k));
+  }
+  return SKY[SKY.length - 1];
+}
+
+function drawSky(cars) {
+  const f = Math.max(0, maxRow) / LAP, s = skyNow(f), nf = clamp((f - 1.7) / 1.1, 0, 1);
+  if (s[4] < 0.01 && nf < 0.01) return;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'multiply';
+  ctx.fillStyle = 'rgba(' + (s[1] | 0) + ',' + (s[2] | 0) + ',' + (s[3] | 0) + ',' + s[4].toFixed(3) + ')';
+  ctx.fillRect(0, 0, lo.width, lo.height);
+  if (nf > 0.01) {                                      // street lamps, neon and headlights come up after dark
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = nf * 0.85;
+    const [L0, L1] = visLaps();
+    for (let L = L0; L <= L1; L++) blitMap(lightCv, L);
+    ctx.globalAlpha = 1;
+    ctx.setTransform(RS, 0, 0, RS, shX, shY);
+    const al = (0.2 * nf).toFixed(3);
+    for (const v of cars) {
+      const d = v.car.len * T / 2 + T * 0.45, hx = v.X + Math.cos(v.a) * d, hy = v.Y + Math.sin(v.a) * d;
+      circle(hx, hy, T * 0.42, 'rgba(255,236,170,' + al + ')');
+      circle(hx, hy, T * 0.22, 'rgba(255,236,170,' + al + ')');
+      if (v.car.kind === 'cop') circle(v.X, v.Y, T * 1.1, Math.floor(time * 7 + v.car.phase) % 2 ? 'rgba(60,110,255,' + al + ')' : 'rgba(255,40,60,' + al + ')');
+    }
+    if (player.alive) {
+      const e = easeOut(player.t);
+      circle(snap(sx(lerp(player.fromCol, player.col, e) + 0.5)), snap(sy(lerp(player.fromRow, player.row, e) + 0.5)), T * 0.8, 'rgba(255,230,190,' + (0.14 * nf).toFixed(3) + ')');
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+}
+
 // ---------------------------------------------------------------- frame
 function draw() {
-  ctx.setTransform(RS, 0, 0, RS, 0, 0);
+  camXpx = Math.round(drawCX * TN);
+  camYpx = Math.round(drawCY * TN);
+  shX = shY = 0;
+  if (shake > 0) { const m = shake * 20 * RS; shX = Math.round((Math.random() - 0.5) * m); shY = Math.round((Math.random() - 0.5) * m); }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.imageSmoothingEnabled = false;
-  if (shake > 0) {
-    const m = shake * 20;
-    ctx.translate(snap((Math.random() - 0.5) * m), snap((Math.random() - 0.5) * m));
-  }
-  const yb = Math.floor(camY) - 1, yt = Math.ceil(camY + rowsVis) + 1;
-  const c0 = Math.floor(visL) - 1, c1 = Math.ceil(visR) + 1;
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#2a2630';
+  ctx.fillRect(0, 0, lo.width, lo.height);
+  const [L0, L1] = visLaps(), campus = drawCY < 0.5;
+  if (campus) blitMap(campusCv, -1);
+  for (let L = L0; L <= L1; L++) blitMap(lapCv, L);
 
-  for (let y = yt; y >= yb; y--) drawGround(y, c0, c1);
-  for (let y = yt; y >= yb; y--) { const r = rows.get(y); if (!r || r.kind === 'side') drawEdgeDecor(y, c0, c1); }
-  if (!player.alive) drawPlayer();                 // flattened student goes under the traffic
-  for (let y = yt; y >= yb; y--) { const r = rows.get(y); if (r && r.kind === 'road') drawTraffic(r, y); }
+  ctx.setTransform(RS, 0, 0, RS, shX, shY);
+  const x0 = drawCX - 1, x1 = drawCX + viewCols + 1, y0 = drawCY - 1, y1 = drawCY + rowsVis + 1;
+  for (let L = L0; L <= L1; L++) for (const e of LIVE) {   // animated signs over the painted map
+    const top = L * LAP + e.r + 1;
+    if (top < y0 || top - 4 > y1 || e.c + e.w < x0 || e.c > x1) continue;
+    ox = sx(e.c); oy = sy(top); e.draw();
+  }
+  if (campus) for (const e of CLIVE) { if (e.r + 1 >= y0 && e.c <= x1 && e.c + 2 >= x0) { ox = sx(e.c); oy = sy(e.r + 1); e.draw(); } }
+  drawObstacles(x0, x1, y0, y1);
+  if (!player.alive) drawPlayer();                      // flattened student goes under the traffic
+  const cars = drawVehicles(x0 - 2, x1 + 2, y0 - 2, y1 + 2);
   drawParticles();
   if (player.alive) drawPlayer();
-
-  // dim the out-of-bounds downtown so the playable strip reads clearly
-  ctx.fillStyle = 'rgba(14,18,28,0.2)';
-  ctx.fillRect(-40, -40, offX + 40, H + 80);
-  ctx.fillRect(offX + COLS * T, -40, W, H + 80);
-
-  drawCopWarnings(yb, yt);
+  drawCrowd();
+  drawSky(cars);
+  drawCrowdWarning();
 
   // present: blow the art buffer up to the screen with hard edges, then lay faint scanlines over it
   mainCtx.setTransform(1, 0, 0, 1, 0, 0);
@@ -1393,11 +2547,280 @@ const PX = {
   toast: { s: 3, min: 2, max: () => Math.min(innerWidth - 40, 360) - 26, wrap: true },
 };
 
+// ---------------------------------------------------------------- layout
+let artKey = '';
+function resize() {
+  W = window.innerWidth;
+  H = window.innerHeight;
+  DPR = Math.min(window.devicePixelRatio || 1, 3);
+  canvas.width = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  // about 16 art pixels per tile; wide screens never see more than 36 columns so the blocks stay readable
+  const T0 = Math.max(Math.min(W / VIEW_COLS, H / MIN_VIEW_ROWS), W / 36);
+  P = Math.max(1, Math.floor(T0 * DPR / 16));
+  RS = DPR / P;
+  TN = Math.max(4, Math.floor(T0 * RS));
+  T = TN / RS;
+  lo.width = Math.ceil(canvas.width / P);
+  lo.height = Math.ceil(canvas.height / P);
+  scanPat = null;
+  if (P >= 3) {                       // faint scanlines, one per art pixel row
+    const sc = document.createElement('canvas');
+    sc.width = 1; sc.height = P;
+    const g = sc.getContext('2d');
+    g.fillStyle = 'rgba(0,0,0,0.13)';
+    const n = Math.max(1, Math.round(P / 4));
+    g.fillRect(0, P - n, 1, n);
+    scanPat = mainCtx.createPattern(sc, 'repeat');
+  }
+  rowsVis = H / T;
+  viewCols = W / T;
+  const key = TN + '|' + RS;
+  if (key !== artKey) { artKey = key; buildArt(); }   // the map is painted once per pixel scale
+  refreshPxText();
+  if (state === 'menu') snapCamera();
+}
+
+// ---------------------------------------------------------------- camera
+function playerPos() {
+  const e = easeOut(player.t);
+  return [lerp(player.fromCol, player.col, e) + 0.5, lerp(player.fromRow, player.row, e) + 0.5];
+}
+function camTarget() {
+  const [x, y] = playerPos();
+  const ty = Math.max(y - rowsVis * CAM_FRAC, creepY - 1.5, -CAMPUS);   // never lose sight of the crowd
+  const tx = viewCols >= WCOLS ? (WCOLS - viewCols) / 2 : clamp(x - viewCols / 2, 0, WCOLS - viewCols);
+  return [tx, ty];
+}
+function snapCamera() {
+  [camX, camY] = camTarget();
+  drawCX = camX; drawCY = camY;
+}
+function followCamera(dt) {
+  const [tx, ty] = camTarget(), k = Math.min(1, dt * 7);
+  camX += (tx - camX) * k;
+  camY += (ty - camY) * k;
+  drawCX = camX; drawCY = camY;
+}
+
+// ---------------------------------------------------------------- storage, HUD, toasts
+function loadBest() {
+  try { return Math.max(0, parseInt(localStorage.getItem(BEST_KEY), 10) || 0); } catch (e) { return 0; }
+}
+function saveBest(v) {
+  try { localStorage.setItem(BEST_KEY, String(v)); } catch (e) { /* storage blocked: best lives for this session only */ }
+}
+
+const streetEl = document.getElementById('street');
+PX.street = { s: 2, min: 1, max: () => innerWidth - 32, shadow: '#1d1b2e' };
+PX.fact = { s: 2, min: 1, max: () => Math.min(innerWidth - 40, 360) - 26, wrap: true };
+
+function updateHud() {
+  pxText(scoreEl, score(), PX.score);
+  pxText(hudBestEl, 'BEST ' + Math.max(best, score()), PX.hudBest);
+}
+function setStreet(name) {
+  if (name === streetName) return;
+  streetName = name;
+  pxText(streetEl, name, PX.street);
+}
+
+const toastQ = [];
+let toastUntil = 0;
+function showToastNow(msg) {
+  const d = Math.min(5.5, 1.8 + msg.length * 0.04);
+  pxText(toastEl, msg, msg.length > 34 ? PX.fact : PX.toast);
+  toastEl.style.animationDuration = d.toFixed(2) + 's';
+  toastEl.classList.remove('show');
+  void toastEl.offsetWidth;
+  toastEl.classList.add('show');
+  toastUntil = time + d;
+}
+function toast(msg, now) {
+  if (now) { toastQ.length = 0; showToastNow(msg); return; }
+  if (toastQ.length < 3 && !toastQ.includes(msg)) toastQ.push(msg);
+}
+function pumpToasts() {
+  if (toastQ.length && time >= toastUntil - 0.25) showToastNow(toastQ.shift());
+}
+function clearToasts() {
+  toastQ.length = 0;
+  toastUntil = 0;
+  toastEl.classList.remove('show');
+}
+
+const LAP_LINES = [
+  null,
+  'Back on Broad St. Downtown again, and the sun is getting low.',
+  'Dusk downtown. The bars are lighting up.',
+  'Night on Broad St. Gameday never ends.',
+];
+
+// ---------------------------------------------------------------- run lifecycle
+function resetGame() {
+  Object.assign(player, {
+    col: START_COL, row: START_ROW, fromCol: START_COL, fromRow: START_ROW, t: 1, face: 0, queued: null, alive: true, bump: 0,
+  });
+  creepY = -CAMPUS; creepOn = false; maxRow = START_ROW; playT = 0; deathT = 0; shake = 0;
+  isNewBest = false; lapShown = 0; archToastAt = -9; particles = [];
+  seen.clear();
+  clearToasts();
+  streetName = '';
+  setStreet(placeName(player.col, player.row));
+  snapCamera();
+  resetTraffic();
+  snapCamera();
+  freshWorld = true;
+  updateHud();
+}
+
+function startGame() {
+  if (state === 'play' || state === 'dying') return;
+  if (state === 'over' && performance.now() - overShownAt < 450) return;   // swallow frantic taps from the run that just ended
+  if (!freshWorld) resetGame();
+  freshWorld = false;
+  state = 'play';
+  startEl.classList.add('hidden');
+  overEl.classList.add('hidden');
+  hudEl.classList.remove('hidden');
+  inputLockUntil = performance.now() + 150;
+  updateHud();
+  toast('Gameday! The crowd is right behind you. Keep moving!', true);
+}
+
+function showGameOver() {
+  state = 'over';
+  clearToasts();
+  const line = pick(DEATH_LINES[killer] || DEATH_LINES.car);
+  pxText(overTitleEl, line[0], PX.head);
+  pxText(overTagEl, line[1] + ' Last seen on ' + streetName + '.', PX.small);
+  pxText(finalScoreEl, score(), PX.statNum);
+  pxText(finalBestEl, best, PX.statNum);
+  newBestEl.classList.toggle('hidden', !isNewBest);
+  hudEl.classList.add('hidden');
+  overEl.classList.remove('hidden');
+  overShownAt = performance.now();
+}
+
+function die(kind, x, y) {
+  player.alive = false;
+  player.queued = null;
+  state = 'dying';
+  deathT = 0;
+  shake = 0.35;
+  killer = kind;
+  player.deadX = x;
+  player.deadY = y;
+  player.deadRot = FACE_ANGLE[player.face] + rand(-0.4, 0.4);
+  for (let i = 0; i < 14; i++) {      // backpack bursts: homework everywhere
+    particles.push({
+      x, y, vx: rand(-3.2, 3.2), vy: rand(-3, 3), rot: rand(0, 6.28), vr: rand(-9, 9),
+      life: rand(0.9, 1.6), t: 0, w: rand(0.14, 0.22), c: pick(['#ffffff', '#fdf6d8', '#f7e27a', '#cfe8ff']),
+    });
+  }
+  if (kind === 'crowd') for (let i = 0; i < 26; i++) {   // and the crowd throws confetti
+    particles.push({
+      x: x + rand(-1.5, 1.5), y: y - rand(0, 1), vx: rand(-2, 2), vy: rand(1.5, 5), rot: rand(0, 6.28), vr: rand(-12, 12),
+      life: rand(1, 1.8), t: 0, w: rand(0.08, 0.13), c: pick(['#c41e3a', '#c41e3a', '#1c1b20', '#f1efe8']),
+    });
+  }
+  const s = score();
+  if (s > best) { best = s; saveBest(best); isNewBest = true; }
+  pxText(startBestEl, best > 0 ? 'Best: ' + best : '', PX.small);
+}
+
+// ---------------------------------------------------------------- movement
+function requestMove(dc, dr) {
+  if (state !== 'play' || !player.alive) return;
+  if (performance.now() < inputLockUntil) return;
+  if (player.t < 1) { player.queued = [dc, dr]; return; }   // buffer one move so fast tapping feels snappy
+  doMove(dc, dr);
+}
+
+function doMove(dc, dr) {
+  const face = dr > 0 ? 0 : dr < 0 ? 2 : dc > 0 ? 1 : 3;
+  player.face = face;
+  const nc = player.col + dc, nr = player.row + dr;
+  if (blocked(nc, nr)) {
+    player.bump = 1;
+    player.bumpFace = face;
+    if (tileKind(nc, nr) === 'arch' && time - archToastAt > 4) {
+      archToastAt = time;
+      toast('No walking under the Arch until you graduate!', true);
+    }
+    return;
+  }
+  player.fromCol = player.col;
+  player.fromRow = player.row;
+  player.col = nc;
+  player.row = nr;
+  player.t = 0;
+  if (nr > maxRow) maxRow = nr;
+  updateHud();
+  arrive(nc, nr);
+}
+
+function arrive(c, r) {
+  setStreet(placeName(c, r));
+  const L = r >= 0 ? lapOf(r) : 0;
+  if (L > lapShown) {
+    lapShown = L;
+    toast(LAP_LINES[L] || 'Lap ' + (L + 1) + '. Still going.', true);
+  }
+  const lr = r < 0 ? r : mod(r, LAP);
+  FACTS.forEach((f, i) => {
+    if (seen.has(i) || !!f.campus !== r < 0) return;
+    if (f.plaque ? !isPlaque(c, lr) : c < f.c0 || c > f.c1 || lr < f.r0 || lr > f.r1) return;
+    seen.add(i);
+    toast(f.text);
+  });
+}
+
+// ---------------------------------------------------------------- update
+function update(dt) {
+  time += dt;
+  if (player.t < 1) {
+    player.t = Math.min(1, player.t + dt / HOP_TIME);
+    if (player.t >= 1 && player.queued && player.alive && state === 'play') {
+      const q = player.queued;
+      player.queued = null;
+      doMove(q[0], q[1]);
+    }
+  }
+  if (player.bump > 0) player.bump = Math.max(0, player.bump - dt * 7);
+
+  if (state === 'play' || state === 'dying') { playT += dt; updateCreep(dt); }
+  followCamera(dt);
+  updateTraffic(dt);
+
+  if (state === 'play' && player.alive) {
+    const [x, y] = playerPos(), k = hitTest(x, y);
+    if (k) die(k, x, y);
+    else if (creepY > y - 0.2) die('crowd', x, y);
+  }
+
+  if (state === 'dying' || state === 'over') deathT += dt;
+  if (state === 'dying' && deathT >= 1.0) showGameOver();
+  if (shake > 0) shake = Math.max(0, shake - dt);
+
+  const k = Math.exp(-3 * dt);
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.t += dt;
+    if (p.t >= p.life) { particles.splice(i, 1); continue; }
+    p.vx *= k; p.vy *= k; p.vr *= k;
+    p.x += p.vx * dt; p.y += p.vy * dt; p.rot += p.vr * dt;
+  }
+  if (state === 'play') pumpToasts();
+}
+
 // ---------------------------------------------------------------- boot
 const finePointer = window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches;
 pxText(howEl, finePointer
-  ? "Arrow keys or WASD to hop, click to hop forward. Don't get hit!"
-  : "Tap to hop forward, swipe to dodge. Don't get hit!", PX.small);
+  ? 'Arrow keys or WASD to hop. Turn down streets, and keep ahead of the gameday crowd!'
+  : 'Tap to hop forward, swipe to turn down streets. The gameday crowd is right behind you!', PX.small);
 pxText(startBestEl, best > 0 ? 'Best: ' + best : '', PX.small);
 pxText(document.querySelector('h1 .a'), 'Jaywalk', PX.title);
 pxText(document.querySelector('h1 .b'), 'Athens', PX.title2);
@@ -1405,7 +2828,6 @@ pxText(playBtn, 'Play', PX.btn);
 pxText(againBtn, 'Play Again', PX.btn);
 pxText(newBestEl, 'New best!', PX.badge);
 document.querySelectorAll('.stat > span').forEach(el => pxText(el, el.textContent, PX.statLabel));
-updateHud();
 
 window.addEventListener('resize', resize);
 window.addEventListener('orientationchange', () => setTimeout(resize, 150));
@@ -1414,6 +2836,7 @@ if (window.visualViewport) window.visualViewport.addEventListener('resize', resi
 resize();
 resetGame();
 requestAnimationFrame(frame);
+
 })();
 </script>
 </body>
